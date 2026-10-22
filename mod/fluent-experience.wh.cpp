@@ -2,7 +2,7 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.15
+// @version         0.16
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
@@ -84,6 +84,7 @@ Changes apply immediately, no restart needed.
 
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.UI.Composition.h>
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Hosting.h>
@@ -124,6 +125,7 @@ struct Settings {
     int animationDuration;
     int margin;
     bool settingsButton;
+    bool hiddenIconMenu;
     bool checkUpdates;
     std::wstring language;
     std::wstring logFile;
@@ -246,6 +248,7 @@ Settings ReadSettings() {
         std::clamp(ReadIntSetting(key, L"animationDuration", 200), 1, 2000);
     settings.margin = std::clamp(ReadIntSetting(key, L"margin", 8), 0, 200);
     settings.settingsButton = ReadIntSetting(key, L"settingsButton", 1);
+    settings.hiddenIconMenu = ReadIntSetting(key, L"hiddenIconMenu", 1);
     settings.checkUpdates = ReadIntSetting(key, L"checkUpdates", 1);
     settings.language = ReadStringSetting(key, L"language", L"en");
     settings.logFile = ReadStringSetting(key, L"logFile", L"");
@@ -441,6 +444,16 @@ bool IsTaskbarWindow(HWND hWnd) {
            _wcsicmp(szClassName, L"Shell_SecondaryTrayWnd") == 0;
 }
 
+// The hidden icon menu, opened by the arrow before the tray icons: a window of
+// its own with a XAML island.
+constexpr WCHAR kHiddenIconMenuClass[] = L"TopLevelWindowForOverflowXamlIsland";
+
+bool IsHiddenIconMenuWindow(HWND hWnd) {
+    WCHAR szClassName[64];
+    return GetClassName(hWnd, szClassName, ARRAYSIZE(szClassName)) &&
+           _wcsicmp(szClassName, kHiddenIconMenuClass) == 0;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Dynamic width
 
@@ -495,6 +508,18 @@ constexpr DWORD kDwmsbtTabbedWindow = 4;     // Mica Alt
 
 bool UseWindowsMaterial() {
     return IsActive() && g_settings.material != Material::windowsDefault;
+}
+
+// The hidden icon menu takes the taskbar's material when its setting is on.
+bool StyleHiddenIconMenu() {
+    return UseWindowsMaterial() && g_settings.hiddenIconMenu;
+}
+
+// Whether a window gets the Windows material: a taskbar, or the hidden icon
+// menu.
+bool UseWindowsMaterialFor(HWND hWnd) {
+    return IsHiddenIconMenuWindow(hWnd) ? StyleHiddenIconMenu()
+                                        : UseWindowsMaterial();
 }
 
 bool IsTaskbarLightTheme() {
@@ -619,7 +644,7 @@ LRESULT CALLBACK ActivationSubclassProc(HWND hWnd,
                                         DWORD_PTR) {
     LRESULT result = DefSubclassProc(hWnd, msg, wParam, lParam);
 
-    if (msg == WM_NCACTIVATE && !wParam && UseWindowsMaterial()) {
+    if (msg == WM_NCACTIVATE && !wParam && UseWindowsMaterialFor(hWnd)) {
         DebugLog(L"Deactivated %p, shown as active again", hWnd);
         ShowBackdropAsActive(hWnd);
     }
@@ -759,6 +784,285 @@ void ApplyBackgroundStyle(FrameworkElement taskbarFrame) {
             element.ClearValue(UIElement::OpacityProperty());
         }
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Hidden icon menu
+//
+// Windows draws the menu's surface (OverflowFlyoutBackgroundBorder) with
+// in-app Acrylic, which blurs what's behind it inside the menu: nothing, so it
+// looks flat. With its setting on, a layer with the host backdrop (the desktop
+// behind the window, provided by Windows) goes right below the surface, with
+// its shape, so Windows' own Acrylic has the desktop to blur. The menu window
+// is given the DWM permission the host backdrop needs
+// (DWMWA_USE_HOSTBACKDROPBRUSH) and is shown as active, as the host backdrop
+// is flat on inactive windows. The layer is in the menu's content, so Windows'
+// animation moves it with the surface. Used only from the taskbar thread.
+
+bool g_hiddenIconMenuStyled;
+winrt::weak_ref<FrameworkElement> g_hiddenIconMenuContent;
+
+constexpr WCHAR kHiddenIconMenuSurface[] = L"OverflowFlyoutBackgroundBorder";
+constexpr DWORD kDwmwaUseHostBackdropBrush = 17;
+
+// The light layer of the surface's Acrylic, the closest match to the taskbar's
+// material over white, grays, black and colors (measured on screen against the
+// taskbar, 2026-10-22): Windows' tint (light theme: 252,252,252) scaled to 203,
+// at 0.8.
+constexpr double kHiddenIconMenuTintLightness = 203.0 / 252.0;
+constexpr double kHiddenIconMenuLuminosity = 0.8;
+
+// The layer added below the surface, in the same panel.
+winrt::weak_ref<Controls::Border> g_hiddenIconMenuBackdrop;
+
+// The surface's background and border, with the values to put back.
+winrt::weak_ref<Controls::Border> g_hiddenIconMenuSurface;
+winrt::Windows::Foundation::IInspectable g_hiddenIconMenuSurfaceBackground{nullptr};
+winrt::Windows::Foundation::IInspectable g_hiddenIconMenuSurfaceBorder{nullptr};
+
+void RestoreSurfaceValue(Controls::Border surface,
+                         DependencyProperty property,
+                         winrt::Windows::Foundation::IInspectable saved) {
+    if (!saved) {
+        return;
+    }
+    if (saved == DependencyProperty::UnsetValue()) {
+        surface.ClearValue(property);
+    } else {
+        surface.SetValue(property, saved);
+    }
+}
+
+void RemoveMenuBackdrop() {
+    if (auto surface = g_hiddenIconMenuSurface.get()) {
+        RestoreSurfaceValue(surface, Controls::Border::BackgroundProperty(),
+                            g_hiddenIconMenuSurfaceBackground);
+        RestoreSurfaceValue(surface, Controls::Border::BorderBrushProperty(),
+                            g_hiddenIconMenuSurfaceBorder);
+    }
+    g_hiddenIconMenuSurface = nullptr;
+    g_hiddenIconMenuSurfaceBackground = nullptr;
+    g_hiddenIconMenuSurfaceBorder = nullptr;
+
+    if (auto backdrop = g_hiddenIconMenuBackdrop.get()) {
+        if (auto panel = Media::VisualTreeHelper::GetParent(backdrop)
+                             .try_as<Controls::Panel>()) {
+            uint32_t index;
+            if (panel.Children().IndexOf(backdrop, index)) {
+                panel.Children().RemoveAt(index);
+            }
+        }
+    }
+    g_hiddenIconMenuBackdrop = nullptr;
+}
+
+// Returns false while the surface isn't there yet.
+bool AddMenuBackdrop(FrameworkElement root) {
+    auto surface = FindDescendantByName(root, kHiddenIconMenuSurface, 8)
+                       .try_as<Controls::Border>();
+    if (!surface || surface.ActualWidth() <= 0) {
+        return false;
+    }
+
+    auto panel =
+        Media::VisualTreeHelper::GetParent(surface).try_as<Controls::Panel>();
+    if (!panel) {
+        DebugLog(L"Hidden icon menu surface: no panel");
+        return true;
+    }
+
+    // Same place and shape as the surface.
+    Controls::Border backdrop;
+    backdrop.Name(L"FluentExperienceMenuBackdrop");
+    backdrop.CornerRadius(surface.CornerRadius());
+    backdrop.Margin(surface.Margin());
+    backdrop.HorizontalAlignment(surface.HorizontalAlignment());
+    backdrop.VerticalAlignment(surface.VerticalAlignment());
+    backdrop.Width(surface.Width());
+    backdrop.Height(surface.Height());
+    backdrop.IsHitTestVisible(false);
+    Controls::Grid::SetRow(backdrop, Controls::Grid::GetRow(surface));
+    Controls::Grid::SetColumn(backdrop, Controls::Grid::GetColumn(surface));
+    Controls::Grid::SetRowSpan(backdrop, Controls::Grid::GetRowSpan(surface));
+    Controls::Grid::SetColumnSpan(backdrop, Controls::Grid::GetColumnSpan(surface));
+
+    // Added last, so Windows' elements keep their positions in the panel, and
+    // drawn below the surface by its z-index.
+    Controls::Canvas::SetZIndex(backdrop, Controls::Canvas::GetZIndex(surface) - 1);
+    panel.Children().Append(backdrop);
+    g_hiddenIconMenuBackdrop = winrt::make_weak(backdrop);
+
+    // The host backdrop as the layer's own composition visual, with the
+    // surface's rounded corners; it follows the layer's size.
+    try {
+        namespace wuc = winrt::Windows::UI::Composition;
+        auto compositor =
+            Hosting::ElementCompositionPreview::GetElementVisual(backdrop).Compositor();
+        wuc::SpriteVisual visual = compositor.CreateSpriteVisual();
+        visual.Brush(compositor.CreateHostBackdropBrush());
+
+        float radius = (float)surface.CornerRadius().TopLeft;
+        auto shape = compositor.CreateRoundedRectangleGeometry();
+        shape.CornerRadius({radius, radius});
+        visual.Clip(compositor.CreateGeometricClip(shape));
+
+        auto resize = [visual, shape](float width, float height) {
+            visual.Size({width, height});
+            shape.Size({width, height});
+        };
+        resize((float)surface.ActualWidth(), (float)surface.ActualHeight());
+        backdrop.SizeChanged([resize](const auto&, const SizeChangedEventArgs& args) {
+            resize(args.NewSize().Width, args.NewSize().Height);
+        });
+
+        Hosting::ElementCompositionPreview::SetElementChildVisual(backdrop, visual);
+    } catch (const winrt::hresult_error& ex) {
+        DebugLog(L"Hidden icon menu backdrop: %08X %s", ex.code().value,
+                 ex.message().c_str());
+    }
+
+    g_hiddenIconMenuSurface = winrt::make_weak(surface);
+
+    // The thin border Windows draws around the menu goes with the taskbar's
+    // "Hide window border" setting.
+    if (!g_settings.border) {
+        g_hiddenIconMenuSurfaceBorder =
+            surface.ReadLocalValue(Controls::Border::BorderBrushProperty());
+        surface.BorderBrush(
+            Media::SolidColorBrush(winrt::Windows::UI::Colors::Transparent()));
+    }
+
+    // Windows' Acrylic stays on the surface, now with the desktop to blur, with
+    // its light layer set to match the taskbar's material.
+    if (auto acrylic = surface.Background().try_as<Media::AcrylicBrush>()) {
+        auto tint = acrylic.TintColor();
+        winrt::Windows::UI::Color light{
+            tint.A,
+            (BYTE)std::lround(tint.R * kHiddenIconMenuTintLightness),
+            (BYTE)std::lround(tint.G * kHiddenIconMenuTintLightness),
+            (BYTE)std::lround(tint.B * kHiddenIconMenuTintLightness),
+        };
+
+        Media::AcrylicBrush matched;
+        matched.BackgroundSource(acrylic.BackgroundSource());
+        matched.TintColor(light);
+        matched.TintOpacity(0);
+        matched.TintLuminosityOpacity(kHiddenIconMenuLuminosity);
+        matched.FallbackColor(acrylic.FallbackColor());
+
+        g_hiddenIconMenuSurfaceBackground =
+            surface.ReadLocalValue(Controls::Border::BackgroundProperty());
+        surface.Background(matched);
+    }
+
+    DebugLog(L"Hidden icon menu backdrop added");
+    return true;
+}
+
+HWND FindHiddenIconMenuWindow() {
+    HWND found = nullptr;
+    EnumThreadWindows(
+        GetCurrentThreadId(),
+        [](HWND hWnd, LPARAM lParam) -> BOOL {
+            if (IsHiddenIconMenuWindow(hWnd)) {
+                *(HWND*)lParam = hWnd;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        (LPARAM)&found);
+    return found;
+}
+
+void ApplyHiddenIconMenuStyle() {
+    HWND hWnd = FindHiddenIconMenuWindow();
+    auto content = g_hiddenIconMenuContent.get();
+    bool style = StyleHiddenIconMenu();
+    if (!hWnd || !content || style == g_hiddenIconMenuStyled) {
+        return;
+    }
+
+    auto xamlRoot = content.XamlRoot();
+    auto root = xamlRoot ? xamlRoot.Content().try_as<FrameworkElement>() : nullptr;
+
+    if (style) {
+        // The permission first, then the layer that needs it.
+        BOOL allow = TRUE;
+        HRESULT hr = DwmSetWindowAttribute(hWnd, kDwmwaUseHostBackdropBrush,
+                                           &allow, sizeof(allow));
+        DebugLog(L"Hidden icon menu %p: host backdrop allowed %08X", hWnd, hr);
+        if (FAILED(hr) || !root || !AddMenuBackdrop(root)) {
+            return;
+        }
+    } else {
+        RemoveMenuBackdrop();
+        BOOL allow = FALSE;
+        DwmSetWindowAttribute(hWnd, kDwmwaUseHostBackdropBrush, &allow,
+                              sizeof(allow));
+    }
+
+    WatchActivation(hWnd, style);
+    DefWindowProc(hWnd, WM_NCACTIVATE, style, 0);
+
+    g_hiddenIconMenuStyled = style;
+    DebugLog(L"Hidden icon menu %p: styled %d", hWnd, style);
+}
+
+HWND FindCurrentProcessTaskbarWnd();
+
+// The menu's content is measured when the menu is created: its window exists
+// then. The style is applied after the layout pass, from the taskbar thread's
+// message.
+using NotificationAreaOverflow_MeasureOverride_t =
+    int(WINAPI*)(void* pThis,
+                 winrt::Windows::Foundation::Size size,
+                 winrt::Windows::Foundation::Size* resultSize);
+NotificationAreaOverflow_MeasureOverride_t
+    NotificationAreaOverflow_MeasureOverride_Original;
+int WINAPI NotificationAreaOverflow_MeasureOverride_Hook(
+    void* pThis,
+    winrt::Windows::Foundation::Size size,
+    winrt::Windows::Foundation::Size* resultSize) {
+    g_hookCallCounter++;
+
+    int ret = NotificationAreaOverflow_MeasureOverride_Original(pThis, size,
+                                                                resultSize);
+
+    // The function may be shared with other elements: the class is checked.
+    try {
+        FrameworkElement content = nullptr;
+        ((IUnknown*)pThis)
+            ->QueryInterface(winrt::guid_of<FrameworkElement>(),
+                             winrt::put_abi(content));
+        if (content &&
+            winrt::get_class_name(content) == L"SystemTray.NotificationAreaOverflow") {
+            g_hiddenIconMenuContent = winrt::make_weak(content);
+            if (StyleHiddenIconMenu() != g_hiddenIconMenuStyled) {
+                if (HWND hTaskbarWnd = FindCurrentProcessTaskbarWnd()) {
+                    PostMessage(hTaskbarWnd, g_applyStyleMsg, 1, 0);
+                }
+            }
+        }
+    } catch (const winrt::hresult_error& ex) {
+        DebugLog(L"Error %08X: %s", ex.code().value, ex.message().c_str());
+    }
+
+    g_hookCallCounter--;
+
+    return ret;
+}
+
+bool HookSystemTrayDllSymbols(HMODULE module) {
+    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
+        {
+            {LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::SystemTray::implementation::NotificationAreaOverflow,struct winrt::Windows::UI::Xaml::IFrameworkElementOverrides>::MeasureOverride(struct winrt::Windows::Foundation::Size,struct winrt::Windows::Foundation::Size *))"},
+            &NotificationAreaOverflow_MeasureOverride_Original,
+            NotificationAreaOverflow_MeasureOverride_Hook,
+        },
+    };
+
+    return WindhawkUtils::HookSymbols(module, symbolHooks,
+                                      ARRAYSIZE(symbolHooks));
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1168,6 +1472,12 @@ void ApplyCustomizationsToAllFrames() {
             DebugLog(L"Error %08X: %s", ex.code().value, ex.message().c_str());
         }
     }
+
+    try {
+        ApplyHiddenIconMenuStyle();
+    } catch (const winrt::hresult_error& ex) {
+        DebugLog(L"Error %08X: %s", ex.code().value, ex.message().c_str());
+    }
 }
 
 // The monitor index, added to the width: two taskbars with the same icons stay
@@ -1453,6 +1763,20 @@ void HandleLoadedModuleIfTaskbarView(HMODULE module, LPCWSTR lpLibFileName) {
     }
 }
 
+std::atomic<bool> g_systemTrayDllHooked;
+
+// SystemTray.dll holds the hidden icon menu.
+void HandleLoadedModuleIfSystemTray(HMODULE module, LPCWSTR lpLibFileName) {
+    if (!g_systemTrayDllHooked && GetModuleHandle(L"SystemTray.dll") == module &&
+        !g_systemTrayDllHooked.exchange(true)) {
+        DebugLog(L"Loaded %s", lpLibFileName);
+
+        if (HookSystemTrayDllSymbols(module)) {
+            Wh_ApplyHookOperations();
+        }
+    }
+}
+
 using LoadLibraryExW_t = decltype(&LoadLibraryExW);
 LoadLibraryExW_t LoadLibraryExW_Original;
 HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName,
@@ -1461,6 +1785,7 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName,
     HMODULE module = LoadLibraryExW_Original(lpLibFileName, hFile, dwFlags);
     if (module) {
         HandleLoadedModuleIfTaskbarView(module, lpLibFileName);
+        HandleLoadedModuleIfSystemTray(module, lpLibFileName);
     }
 
     return module;
@@ -1826,6 +2151,14 @@ constexpr SettingsText kSettingsTexts[] = {
      L"Un pulsante sulla barra delle applicazioni, prima dell'orologio, che "
      L"apre questa finestra"},
 
+    {L"HiddenIconMenu", L"Hidden icon menu", L"Menu icone nascoste"},
+    {L"HiddenIconMenuDesc",
+     L"The menu opened by the arrow before the tray icons shows its Windows "
+     L"Acrylic instead of a flat color, like the taskbar",
+     L"Il menu che si apre con la freccia prima delle icone della barra di "
+     L"sistema mostra il suo Acrylic di Windows invece di un colore pieno, come "
+     L"la barra delle applicazioni"},
+
     {L"MultipleDisplays", L"Multiple displays", L"Più schermi"},
     {L"AppsWhereOpen",
      L"Show taskbar apps on the taskbar where the window is open",
@@ -1911,7 +2244,7 @@ constexpr SettingsText kSettingsTexts[] = {
 constexpr PCWSTR kResettableSettings[] = {
     L"enabled", L"material",          L"border", L"roundedCorners",
     L"dynamicWidth", L"width",        L"padding", L"animationDuration",
-    L"margin",  L"settingsButton",    L"checkUpdates",
+    L"margin",  L"settingsButton",    L"hiddenIconMenu", L"checkUpdates",
 };
 
 constexpr WCHAR kSettingsWindowClass[] = L"FluentExperienceSettingsWindow";
@@ -2080,6 +2413,7 @@ std::wstring SettingsPageXaml() {
     xaml += CardXaml(L"Border", L"E81E", ToggleXaml(L"Border"));
     xaml += CardXaml(L"Margin", L"E74B", SliderXaml(L"Margin", 0, 40, 1));
     xaml += CardXaml(L"SettingsButton", L"E9E9", ToggleXaml(L"SettingsButton"));
+    xaml += CardXaml(L"HiddenIconMenu", L"E70E", ToggleXaml(L"HiddenIconMenu"));
 
     xaml += SectionXaml(L"MultipleDisplays");
     xaml += CardXaml(L"AppsWhereOpen", L"E7F4", ToggleXaml(L"AppsWhereOpen"));
@@ -2211,6 +2545,8 @@ void UpdateSettingsUiStates() {
                                FindToggle(L"RoundedCorners").IsOn()));
     SetCardEnabled(L"Margin", L"MarginSlider", enabled);
     SetCardEnabled(L"SettingsButton", L"SettingsButtonToggle", enabled);
+    SetCardEnabled(L"HiddenIconMenu", L"HiddenIconMenuToggle",
+                   enabled && !defaultMaterial);
     SetCardEnabled(L"DynamicWidth", L"DynamicWidthToggle", enabled);
     SetCardEnabled(L"Width", L"WidthBox", enabled && !dynamicWidth);
     SetCardEnabled(L"Padding", L"PaddingSlider", enabled && dynamicWidth);
@@ -2330,6 +2666,8 @@ void LoadSettingsUi() {
     SetCardTexts(L"Margin", Text(L"Margin"), Text(L"MarginDesc"));
     SetCardTexts(L"SettingsButton", Text(L"SettingsButton"),
                  Text(L"SettingsButtonDesc"));
+    SetCardTexts(L"HiddenIconMenu", Text(L"HiddenIconMenu"),
+                 Text(L"HiddenIconMenuDesc"));
     SetSettingsText(L"MultipleDisplaysSection", Text(L"MultipleDisplays"));
     SetCardTexts(L"AppsWhereOpen", Text(L"AppsWhereOpen"),
                  Text(L"AppsWhereOpenDesc"));
@@ -2357,7 +2695,8 @@ void LoadSettingsUi() {
     SetSettingsText(L"ByText", Text(L"By"));
 
     for (PCWSTR name : {L"Enabled", L"RoundedCorners", L"Border",
-                        L"SettingsButton", L"AppsWhereOpen", L"DynamicWidth",
+                        L"SettingsButton", L"HiddenIconMenu", L"AppsWhereOpen",
+                        L"DynamicWidth",
                         L"CheckUpdates"}) {
         auto toggle = FindToggle(name);
         toggle.OnContent(winrt::box_value(winrt::hstring(Text(L"On"))));
@@ -2381,6 +2720,7 @@ void LoadSettingsUi() {
     FindToggle(L"Border").IsOn(!settings.border);
     FindSlider(L"Margin").Value(settings.margin);
     FindToggle(L"SettingsButton").IsOn(settings.settingsButton);
+    FindToggle(L"HiddenIconMenu").IsOn(settings.hiddenIconMenu);
     FindToggle(L"AppsWhereOpen").IsOn(IsTaskbarAppsWhereWindowOpen());
     FindToggle(L"DynamicWidth").IsOn(settings.dynamicWidth);
     FindToggle(L"CheckUpdates").IsOn(settings.checkUpdates);
@@ -2426,6 +2766,7 @@ void ConnectSettingsUi() {
     ConnectToggle(L"SettingsButton", L"settingsButton");
     ConnectToggle(L"DynamicWidth", L"dynamicWidth");
     ConnectToggle(L"CheckUpdates", L"checkUpdates");
+    ConnectToggle(L"HiddenIconMenu", L"hiddenIconMenu");
     ConnectSlider(L"Margin", L"margin");
     ConnectSlider(L"Width", L"width");
     ConnectSlider(L"Padding", L"padding");
@@ -3375,12 +3716,23 @@ BOOL Wh_ModInit() {
         return FALSE;
     }
 
-    if (HMODULE taskbarViewModule = GetTaskbarViewModuleHandle()) {
+    HMODULE systemTrayModule = GetModuleHandle(L"SystemTray.dll");
+    if (systemTrayModule) {
+        g_systemTrayDllHooked = true;
+        if (!HookSystemTrayDllSymbols(systemTrayModule)) {
+            DebugLog(L"SystemTray.dll hooks failed");
+        }
+    }
+
+    HMODULE taskbarViewModule = GetTaskbarViewModuleHandle();
+    if (taskbarViewModule) {
         g_taskbarViewDllHooked = true;
         if (!HookTaskbarViewDllSymbols(taskbarViewModule)) {
             DebugLog(L"Taskbar.View.dll hooks failed");
         }
-    } else {
+    }
+
+    if (!taskbarViewModule || !systemTrayModule) {
         HMODULE kernelBaseModule = GetModuleHandle(L"kernelbase.dll");
         auto pKernelBaseLoadLibraryExW =
             (decltype(&LoadLibraryExW))GetProcAddress(kernelBaseModule,
@@ -3416,6 +3768,12 @@ void Wh_ModAfterInit() {
         if (HMODULE taskbarViewModule = GetTaskbarViewModuleHandle()) {
             HandleLoadedModuleIfTaskbarView(taskbarViewModule,
                                             L"Taskbar.View.dll");
+        }
+    }
+
+    if (!g_systemTrayDllHooked) {
+        if (HMODULE systemTrayModule = GetModuleHandle(L"SystemTray.dll")) {
+            HandleLoadedModuleIfSystemTray(systemTrayModule, L"SystemTray.dll");
         }
     }
 
