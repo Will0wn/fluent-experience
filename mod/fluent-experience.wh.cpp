@@ -2,7 +2,7 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.16
+// @version         0.17
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
@@ -343,8 +343,11 @@ int GetDockWidthForMonitor(HMONITOR monitor, const RECT& monitorRect) {
     // Until the icons are measured, a dynamic dock is as wide as the screen,
     // like the original taskbar, so Windows doesn't shrink the buttons for
     // lack of room. The monitor index keeps the taskbars' widths distinct.
+    // One pixel less than the screen on every monitor: when the mod is loaded
+    // while the taskbar is screen-wide, the size changes, so the taskbar is
+    // laid out again and measured.
     if (!width && g_settings.dynamicWidth) {
-        width = monitorRect.right - monitorRect.left - GetMonitorIndex(monitor);
+        width = monitorRect.right - monitorRect.left - 1 - GetMonitorIndex(monitor);
     }
 
     if (!width) {
@@ -3560,6 +3563,28 @@ try {
 }
 )";
 
+constexpr PCWSTR kUpdateDownloads[] = {
+    L"fluent-experience.dll",
+    L"fluent-experience.wh.cpp",
+    L"install.ps1",
+};
+
+std::wstring UpdateDownloadDir() {
+    WCHAR tempPath[MAX_PATH];
+    GetTempPath(ARRAYSIZE(tempPath), tempPath);
+    return std::wstring(tempPath) + L"FluentExperienceUpdate";
+}
+
+// What an update downloaded, left if the install script couldn't delete it:
+// the updated mod removes it when it starts.
+void RemoveUpdateDownloads() {
+    std::wstring dir = UpdateDownloadDir();
+    for (PCWSTR name : kUpdateDownloads) {
+        DeleteFile((dir + L"\\" + name).c_str());
+    }
+    RemoveDirectory(dir.c_str());
+}
+
 void InstallUpdate() {
     UpdateInfo info = GetUpdateInfo();
     if (info.state != UpdateState::available) {
@@ -3568,9 +3593,7 @@ void InstallUpdate() {
 
     SetUpdateState(UpdateState::installing);
 
-    WCHAR tempPath[MAX_PATH];
-    GetTempPath(ARRAYSIZE(tempPath), tempPath);
-    std::wstring dir = std::wstring(tempPath) + L"FluentExperienceUpdate";
+    std::wstring dir = UpdateDownloadDir();
     CreateDirectory(dir.c_str(), nullptr);
     std::wstring dllPath = dir + L"\\fluent-experience.dll";
     std::wstring sourcePath = dir + L"\\fluent-experience.wh.cpp";
@@ -3594,10 +3617,7 @@ void InstallUpdate() {
     // Without the install, nothing downloaded stays behind and the update can
     // be tried again.
     auto abandon = [&] {
-        DeleteFile(dllPath.c_str());
-        DeleteFile(sourcePath.c_str());
-        DeleteFile(scriptPath.c_str());
-        RemoveDirectory(dir.c_str());
+        RemoveUpdateDownloads();
         SetUpdateState(UpdateState::available);
     };
 
@@ -3709,6 +3729,7 @@ BOOL Wh_ModInit() {
     RemoveSettingsAppLeftovers();
     TakeOpenSettingsRequest();
     RegisterSettingsLink();
+    RemoveUpdateDownloads();
 
     DebugLog(L"Init");
 
