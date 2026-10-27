@@ -2,7 +2,7 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.17
+// @version         0.18
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
@@ -127,6 +127,7 @@ struct Settings {
     bool settingsButton;
     bool hiddenIconMenu;
     bool checkUpdates;
+    bool debugLog;
     std::wstring language;
     std::wstring logFile;
 };
@@ -173,7 +174,7 @@ void DebugLog(PCWSTR format, ...) {
     Wh_Log(L"%s", buffer);
 
     std::lock_guard<std::mutex> guard(g_logMutex);
-    if (g_settings.logFile.empty()) {
+    if (!g_settings.debugLog || g_settings.logFile.empty()) {
         return;
     }
 
@@ -223,6 +224,13 @@ std::wstring ReadStringSetting(HKEY key, PCWSTR name, PCWSTR defaultValue) {
     return value;
 }
 
+// Where the debug log goes when no log file is set: the temporary folder.
+std::wstring DefaultLogFile() {
+    WCHAR tempPath[MAX_PATH];
+    GetTempPath(ARRAYSIZE(tempPath), tempPath);
+    return std::wstring(tempPath) + L"fluent-experience.log";
+}
+
 // Missing values fall back to the defaults, which the settings window shows
 // too.
 Settings ReadSettings() {
@@ -250,8 +258,12 @@ Settings ReadSettings() {
     settings.settingsButton = ReadIntSetting(key, L"settingsButton", 1);
     settings.hiddenIconMenu = ReadIntSetting(key, L"hiddenIconMenu", 1);
     settings.checkUpdates = ReadIntSetting(key, L"checkUpdates", 1);
+    settings.debugLog = ReadIntSetting(key, L"debugLog", 0);
     settings.language = ReadStringSetting(key, L"language", L"en");
     settings.logFile = ReadStringSetting(key, L"logFile", L"");
+    if (settings.logFile.empty()) {
+        settings.logFile = DefaultLogFile();
+    }
 
     if (key) {
         RegCloseKey(key);
@@ -2202,6 +2214,11 @@ constexpr SettingsText kSettingsTexts[] = {
     {L"ResetDesc", L"Restores every setting to its default value",
      L"Riporta ogni impostazione al valore predefinito"},
     {L"ResetButton", L"Reset", L"Ripristina"},
+    {L"DebugLog", L"Debug log", L"Log di debug"},
+    {L"DebugLogDesc", L"Writes what Fluent Experience does to %s, to report a "
+                      L"problem",
+     L"Scrive quello che fa Fluent Experience in %s, per segnalare un "
+     L"problema"},
 
     {L"Updates", L"Updates", L"Aggiornamenti"},
     {L"UpdateNotChecked", L"Fluent Experience updates",
@@ -2243,11 +2260,12 @@ constexpr SettingsText kSettingsTexts[] = {
     {L"Off", L"Off", L"Disattivato"},
 };
 
-// The values the reset removes; the language and the development log stay.
+// The values the reset removes; the language and the log file path stay.
 constexpr PCWSTR kResettableSettings[] = {
     L"enabled", L"material",          L"border", L"roundedCorners",
     L"dynamicWidth", L"width",        L"padding", L"animationDuration",
     L"margin",  L"settingsButton",    L"hiddenIconMenu", L"checkUpdates",
+    L"debugLog",
 };
 
 constexpr WCHAR kSettingsWindowClass[] = L"FluentExperienceSettingsWindow";
@@ -2439,6 +2457,7 @@ std::wstring SettingsPageXaml() {
     xaml += SectionXaml(L"General");
     xaml += CardXaml(L"Language", L"F2B7",
                      LR"(<ComboBox x:Name="LanguageCombo" MinWidth="160"/>)");
+    xaml += CardXaml(L"DebugLog", L"EBE8", ToggleXaml(L"DebugLog"));
     xaml += CardXaml(L"Reset", L"E777", LR"(<Button x:Name="ResetButton"/>)");
 
     xaml += SectionXaml(L"Updates");
@@ -2683,6 +2702,8 @@ void LoadSettingsUi() {
     SetCardTexts(L"Duration", Text(L"Duration"), Text(L"DurationDesc"));
     SetSettingsText(L"GeneralSection", Text(L"General"));
     SetCardTexts(L"Language", Text(L"Language"), Text(L"LanguageDesc"));
+    SetCardTexts(L"DebugLog", Text(L"DebugLog"),
+                 FormatText(L"DebugLogDesc", settings.logFile).c_str());
     SetCardTexts(L"Reset", Text(L"Reset"), Text(L"ResetDesc"));
     FindSettingsElement<Controls::Button>(L"ResetButton")
         .Content(winrt::box_value(winrt::hstring(Text(L"ResetButton"))));
@@ -2700,7 +2721,7 @@ void LoadSettingsUi() {
     for (PCWSTR name : {L"Enabled", L"RoundedCorners", L"Border",
                         L"SettingsButton", L"HiddenIconMenu", L"AppsWhereOpen",
                         L"DynamicWidth",
-                        L"CheckUpdates"}) {
+                        L"CheckUpdates", L"DebugLog"}) {
         auto toggle = FindToggle(name);
         toggle.OnContent(winrt::box_value(winrt::hstring(Text(L"On"))));
         toggle.OffContent(winrt::box_value(winrt::hstring(Text(L"Off"))));
@@ -2727,6 +2748,7 @@ void LoadSettingsUi() {
     FindToggle(L"AppsWhereOpen").IsOn(IsTaskbarAppsWhereWindowOpen());
     FindToggle(L"DynamicWidth").IsOn(settings.dynamicWidth);
     FindToggle(L"CheckUpdates").IsOn(settings.checkUpdates);
+    FindToggle(L"DebugLog").IsOn(settings.debugLog);
     FindSlider(L"Width").Value(settings.width);
     FindSlider(L"Padding").Value(settings.padding);
     FindSlider(L"Duration").Value(settings.animationDuration);
@@ -2763,6 +2785,7 @@ void ConnectSlider(PCWSTR name, PCWSTR setting) {
     });
 }
 
+void ApplySettingsWindowMaterial(HWND hWnd);
 void ConnectSettingsUi() {
     ConnectToggle(L"Enabled", L"enabled");
     ConnectToggle(L"RoundedCorners", L"roundedCorners");
@@ -2770,6 +2793,7 @@ void ConnectSettingsUi() {
     ConnectToggle(L"DynamicWidth", L"dynamicWidth");
     ConnectToggle(L"CheckUpdates", L"checkUpdates");
     ConnectToggle(L"HiddenIconMenu", L"hiddenIconMenu");
+    ConnectToggle(L"DebugLog", L"debugLog");
     ConnectSlider(L"Margin", L"margin");
     ConnectSlider(L"Width", L"width");
     ConnectSlider(L"Padding", L"padding");
@@ -2788,6 +2812,9 @@ void ConnectSettingsUi() {
                 std::wstring tag = SelectedTag(L"MaterialCombo");
                 WriteStringSetting(L"material",
                                    tag.empty() ? L"acrylic" : tag.c_str());
+                if (HWND hWnd = g_settingsWindow) {
+                    ApplySettingsWindowMaterial(hWnd);
+                }
             });
         });
 
@@ -2916,6 +2943,26 @@ void SetSettingsWindowAppId(HWND hWnd, PCWSTR appId) {
     }
     store->SetValue(kAppUserModelIdKey, value);
     store->Commit();
+}
+
+// The material chosen for the taskbar, read from the settings key (the window
+// applies a change before the watcher reloads the settings). With the Default
+// material, Mica, as for Windows' own Settings window.
+void ApplySettingsWindowMaterial(HWND hWnd) {
+    DWORD backdrop = kDwmsbtMainWindow;
+    switch (ReadSettings().material) {
+        case Material::acrylic:
+            backdrop = kDwmsbtTransientWindow;
+            break;
+        case Material::micaAlt:
+            backdrop = kDwmsbtTabbedWindow;
+            break;
+        case Material::mica:
+        case Material::windowsDefault:
+            break;
+    }
+    DwmSetWindowAttribute(hWnd, kDwmwaSystemBackdropType, &backdrop,
+                          sizeof(backdrop));
 }
 
 // Light or dark like the taskbar: the Windows mode, not the app mode.
@@ -3059,12 +3106,10 @@ void RunSettingsWindow() {
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     SetSettingsWindowAppId(hWnd, kSettingsWindowAppId);
 
-    // Mica, drawn by Windows behind the whole window.
+    // The taskbar's material, drawn by Windows behind the whole window.
     MARGINS margins{-1, -1, -1, -1};
     DwmExtendFrameIntoClientArea(hWnd, &margins);
-    DWORD backdrop = kDwmsbtMainWindow;
-    DwmSetWindowAttribute(hWnd, kDwmwaSystemBackdropType, &backdrop,
-                          sizeof(backdrop));
+    ApplySettingsWindowMaterial(hWnd);
 
     Hosting::WindowsXamlManager manager{nullptr};
     Hosting::DesktopWindowXamlSource source{nullptr};
@@ -3091,6 +3136,9 @@ void RunSettingsWindow() {
         SetWindowPos(g_settingsUi.islandWnd, nullptr, 0, 0, rc.right, rc.bottom,
                      SWP_NOZORDER | SWP_SHOWWINDOW);
 
+        // Drawn as active from the first frame: DWM draws the backdrop as a
+        // flat color on inactive windows.
+        DefWindowProc(hWnd, WM_NCACTIVATE, TRUE, 0);
         ShowWindow(hWnd, SW_SHOWNORMAL);
         SetForegroundWindow(hWnd);
 
