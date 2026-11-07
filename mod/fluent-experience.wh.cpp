@@ -2,12 +2,12 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.18
+// @version         0.19
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -lshcore -lole32 -loleaut32 -lruntimeobject -ldwmapi -lshell32 -lgdi32 -lcomctl32 -lwinhttp
+// @compilerOptions -lshcore -lole32 -loleaut32 -lruntimeobject -ldwmapi -lshell32 -lgdi32 -lcomctl32 -lwinhttp -lshlwapi -luuid
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -48,6 +48,9 @@ of being stuck with a copy of an older design.
 * **Reserved space**: maximized windows stop above the taskbar.
 * **Settings button**: a button on the taskbar, between the tray icons
   and the clock, opens the Fluent Experience settings window.
+* **iOS-style folder icons** (optional, off by default): desktop folders show
+  the icons of what's inside, up to 9, on the iOS app icon shape. Turning it
+  off brings back the previous icons.
 * **Updates**: Fluent Experience checks for new versions on GitHub at startup
   and once a day (this can be turned off). When one is available, the settings
   button shows it the way Windows shows an app that needs attention, and the
@@ -77,6 +80,9 @@ Changes apply immediately, no restart needed.
 #include <propsys.h>
 #include <shellapi.h>
 #include <shellscalingapi.h>
+#include <shlobj.h>
+#include <shlwapi.h>
+#include <shobjidl.h>
 #include <windows.ui.xaml.hosting.desktopwindowxamlsource.h>
 #include <winhttp.h>
 
@@ -96,6 +102,8 @@ Changes apply immediately, no restart needed.
 #include <atomic>
 #include <cmath>
 #include <functional>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -126,6 +134,7 @@ struct Settings {
     int margin;
     bool settingsButton;
     bool hiddenIconMenu;
+    bool folderIcons;
     bool checkUpdates;
     bool debugLog;
     std::wstring language;
@@ -257,6 +266,7 @@ Settings ReadSettings() {
     settings.margin = std::clamp(ReadIntSetting(key, L"margin", 8), 0, 200);
     settings.settingsButton = ReadIntSetting(key, L"settingsButton", 1);
     settings.hiddenIconMenu = ReadIntSetting(key, L"hiddenIconMenu", 1);
+    settings.folderIcons = ReadIntSetting(key, L"folderIcons", 0);
     settings.checkUpdates = ReadIntSetting(key, L"checkUpdates", 1);
     settings.debugLog = ReadIntSetting(key, L"debugLog", 0);
     settings.language = ReadStringSetting(key, L"language", L"en");
@@ -2111,6 +2121,753 @@ void ApplySettings() {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// iOS-style folder icons
+//
+// Desktop folders show the icons of up to 9 items inside, in a 3x3 grid on the
+// iOS app icon shape. Native wherever Windows offers it: the folder icon is set
+// through desktop.ini with SHGetSetFolderCustomSettings, the item icons come
+// from the Shell at the exact size (IShellItemImageFactory), and Explorer is
+// told with SHChangeNotify. Custom only where Windows has nothing: composing
+// the grid into an .ico file. Turning the option off, or unloading the mod,
+// brings back each folder's previous icon and deletes the .ico files.
+
+constexpr WCHAR kFolderIconsBackupSubKey[] =
+    LR"(Software\FluentExperience\FolderIcons)";
+constexpr int kFolderIconSizes[] = {16, 24, 32, 48, 64, 96, 128, 256};
+constexpr int kFolderIconMaxItems = 9;
+constexpr DWORD kFolderIconsDebounce = 1000;
+
+HANDLE g_folderIconsThread;
+HANDLE g_folderIconsStopEvent;
+HANDLE g_folderIconsChangedEvent;
+
+std::wstring FolderIconsDir() {
+    WCHAR path[MAX_PATH];
+    DWORD len = GetEnvironmentVariable(L"LOCALAPPDATA", path, ARRAYSIZE(path));
+    if (!len || len >= ARRAYSIZE(path)) {
+        return L"";
+    }
+    return std::wstring(path) + LR"(\FluentExperience\FolderIcons)";
+}
+
+std::wstring ToLower(std::wstring text) {
+    CharLowerBuff(text.data(), (DWORD)text.size());
+    return text;
+}
+
+bool StartsWithNoCase(const std::wstring& text, const std::wstring& prefix) {
+    return !prefix.empty() && text.size() >= prefix.size() &&
+           CompareStringOrdinal(text.c_str(), (int)prefix.size(), prefix.c_str(),
+                                (int)prefix.size(), TRUE) == CSTR_EQUAL;
+}
+
+uint64_t Fnv1a(const std::wstring& text) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (WCHAR c : text) {
+        hash = (hash ^ (uint16_t)c) * 1099511628211ULL;
+    }
+    return hash;
+}
+
+// The iOS app icon shape on a size x size box, as a polygon: the iOS 7+
+// "continuous corner" rounded rect, reverse-engineered (PaintCode's
+// coefficients). Straight sides; each corner is three Bezier curves.
+std::vector<std::pair<double, double>> IosShapePolygon(double size) {
+    const double r = size * 0.1758, c = size / 2;
+    struct Pt {
+        double u, v;
+    };
+    // Top-right corner: u = in from the right edge, v = down from the top.
+    const Pt start{1.52866483, 0};
+    const Pt curves[][3] = {
+        {{1.08849323, 0}, {0.86840689, 0}, {0.66993427, 0.065496}},
+        {{0.63149399, 0.074911}, {0.63149399, 0.074911}, {0.63149399, 0.074911}},
+        {{0.37282392, 0.16905899}, {0.16905899, 0.37282392}, {0.074911, 0.63149399}},
+        {{0.065496, 0.66993427}, {0.065496, 0.66993427}, {0.065496, 0.66993427}},
+        {{0, 0.86840689}, {0, 1.08849323}, {0, 1.52866483}},
+    };
+
+    std::vector<std::pair<double, double>> points;
+    auto add = [&](Pt p, int quarter) {
+        double dx = size - p.u * r - c, dy = p.v * r - c;
+        for (int i = 0; i < quarter; i++) {
+            double t = dx;
+            dx = -dy;
+            dy = t;
+        }
+        points.push_back({c + dx, c + dy});
+    };
+
+    for (int quarter = 0; quarter < 4; quarter++) {
+        Pt from = start;
+        add(from, quarter);
+        for (const auto& curve : curves) {
+            constexpr int kSteps = 12;
+            for (int i = 1; i <= kSteps; i++) {
+                double t = (double)i / kSteps, s = 1 - t;
+                Pt p{s * s * s * from.u + 3 * s * s * t * curve[0].u +
+                         3 * s * t * t * curve[1].u + t * t * t * curve[2].u,
+                     s * s * s * from.v + 3 * s * s * t * curve[0].v +
+                         3 * s * t * t * curve[1].v + t * t * t * curve[2].v};
+                add(p, quarter);
+            }
+            from = curve[2];
+        }
+    }
+    return points;
+}
+
+bool PointInPolygon(const std::vector<std::pair<double, double>>& polygon,
+                    double x,
+                    double y) {
+    bool inside = false;
+    for (size_t i = 0, j = polygon.size() - 1; i < polygon.size(); j = i++) {
+        auto [xi, yi] = polygon[i];
+        auto [xj, yj] = polygon[j];
+        if ((yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
+            inside = !inside;
+        }
+    }
+    return inside;
+}
+
+// The Shell's icon of a file or folder at size x size, as premultiplied BGRA.
+bool GetShellIcon(const std::wstring& path, int size, std::vector<uint32_t>* out) {
+    winrt::com_ptr<IShellItemImageFactory> factory;
+    if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr,
+                                           IID_PPV_ARGS(factory.put())))) {
+        return false;
+    }
+
+    HBITMAP bitmap = nullptr;
+    if (FAILED(factory->GetImage({size, size}, SIIGBF_ICONONLY, &bitmap)) ||
+        !bitmap) {
+        return false;
+    }
+
+    BITMAP info{};
+    GetObject(bitmap, sizeof(info), &info);
+    int w = info.bmWidth, h = info.bmHeight;
+    std::vector<uint32_t> pixels((size_t)w * h);
+    BITMAPINFO bmi{.bmiHeader = {.biSize = sizeof(BITMAPINFOHEADER),
+                                 .biWidth = w,
+                                 .biHeight = -h,
+                                 .biPlanes = 1,
+                                 .biBitCount = 32,
+                                 .biCompression = BI_RGB}};
+    HDC dc = GetDC(nullptr);
+    int lines = GetDIBits(dc, bitmap, 0, h, pixels.data(), &bmi, DIB_RGB_COLORS);
+    ReleaseDC(nullptr, dc);
+    DeleteObject(bitmap);
+    if (lines != h || w <= 0 || h <= 0) {
+        return false;
+    }
+
+    // The Shell may hand back straight or premultiplied alpha: a color channel
+    // above its alpha can only be straight. No alpha at all means opaque.
+    bool anyAlpha = false, straight = false;
+    for (uint32_t p : pixels) {
+        BYTE a = p >> 24;
+        anyAlpha |= a != 0;
+        straight |= ((p >> 16) & 0xFF) > a || ((p >> 8) & 0xFF) > a || (p & 0xFF) > a;
+    }
+
+    out->assign((size_t)size * size, 0);
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            uint32_t p = pixels[(size_t)(y * h / size) * w + (x * w / size)];
+            uint32_t a = anyAlpha ? p >> 24 : 255;
+            uint32_t b = p & 0xFF, g = (p >> 8) & 0xFF, r = (p >> 16) & 0xFF;
+            if (!anyAlpha || straight) {
+                b = b * a / 255;
+                g = g * a / 255;
+                r = r * a / 255;
+            }
+            (*out)[(size_t)y * size + x] = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+    }
+    return true;
+}
+
+// Source-over of premultiplied BGRA.
+uint32_t BlendOver(uint32_t dst, uint32_t src) {
+    uint32_t sa = src >> 24, inv = 255 - sa, result = 0;
+    for (int shift = 0; shift < 32; shift += 8) {
+        uint32_t s = (src >> shift) & 0xFF, d = (dst >> shift) & 0xFF;
+        result |= std::min<uint32_t>(255, s + d * inv / 255) << shift;
+    }
+    return result;
+}
+
+// The plate: the shape filled with translucent white, premultiplied BGRA.
+// Independent of the items, so it's computed once per size.
+const std::vector<uint32_t>& FolderIconPlate(int size) {
+    static std::map<int, std::vector<uint32_t>> plates;
+    auto found = plates.find(size);
+    if (found != plates.end()) {
+        return found->second;
+    }
+
+    std::vector<uint32_t> pixels((size_t)size * size, 0);
+    auto polygon = IosShapePolygon(size);
+
+    // 4x4 samples per pixel for smooth edges.
+    constexpr int kSamples = 4;
+    constexpr uint32_t kPlateAlpha = 71;  // 28% white
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            int hits = 0;
+            for (int sy = 0; sy < kSamples; sy++) {
+                for (int sx = 0; sx < kSamples; sx++) {
+                    hits += PointInPolygon(polygon, x + (sx + 0.5) / kSamples,
+                                           y + (sy + 0.5) / kSamples);
+                }
+            }
+            uint32_t a = kPlateAlpha * hits / (kSamples * kSamples);
+            pixels[(size_t)y * size + x] = (a << 24) | (a << 16) | (a << 8) | a;
+        }
+    }
+    return plates.emplace(size, std::move(pixels)).first->second;
+}
+
+// One icon image: the plate and the items' icons in a 3x3 grid, row by row.
+// Premultiplied BGRA.
+std::vector<uint32_t> ComposeFolderIcon(const std::vector<std::wstring>& items,
+                                        int size) {
+    std::vector<uint32_t> pixels = FolderIconPlate(size);
+
+    double pad = size * 0.14, gap = size * 0.05;
+    double cell = (size - 2 * pad - 2 * gap) / 3;
+    int cellPx = std::max(1, (int)std::lround(cell));
+    for (size_t i = 0; i < items.size() && i < kFolderIconMaxItems; i++) {
+        std::vector<uint32_t> icon;
+        if (!GetShellIcon(items[i], cellPx, &icon)) {
+            continue;
+        }
+        int left = (int)std::lround(pad + (i % 3) * (cell + gap));
+        int top = (int)std::lround(pad + (i / 3) * (cell + gap));
+        for (int y = 0; y < cellPx; y++) {
+            for (int x = 0; x < cellPx; x++) {
+                int px = left + x, py = top + y;
+                if (px >= 0 && py >= 0 && px < size && py < size) {
+                    uint32_t& dst = pixels[(size_t)py * size + px];
+                    dst = BlendOver(dst, icon[(size_t)y * cellPx + x]);
+                }
+            }
+        }
+    }
+    return pixels;
+}
+
+// An .ico with one 32-bit image per size (straight alpha, empty AND mask).
+bool WriteFolderIconFile(const std::wstring& path,
+                         const std::vector<std::wstring>& items) {
+    std::string header, images;
+    auto put16 = [](std::string& s, uint16_t v) { s.append((char*)&v, 2); };
+    auto put32 = [](std::string& s, uint32_t v) { s.append((char*)&v, 4); };
+
+    put16(header, 0);
+    put16(header, 1);
+    put16(header, (uint16_t)ARRAYSIZE(kFolderIconSizes));
+    uint32_t offset = 6 + 16 * ARRAYSIZE(kFolderIconSizes);
+    std::string entries;
+
+    for (int size : kFolderIconSizes) {
+        std::vector<uint32_t> pixels = ComposeFolderIcon(items, size);
+        uint32_t maskRow = ((size + 31) / 32) * 4;
+        std::string image;
+        put32(image, sizeof(BITMAPINFOHEADER));
+        put32(image, size);
+        put32(image, size * 2);
+        put16(image, 1);
+        put16(image, 32);
+        put32(image, BI_RGB);
+        put32(image, size * size * 4 + maskRow * size);
+        put32(image, 0);
+        put32(image, 0);
+        put32(image, 0);
+        put32(image, 0);
+        for (int y = size - 1; y >= 0; y--) {
+            for (int x = 0; x < size; x++) {
+                uint32_t p = pixels[(size_t)y * size + x], a = p >> 24;
+                uint32_t b = p & 0xFF, g = (p >> 8) & 0xFF, r = (p >> 16) & 0xFF;
+                if (a) {
+                    b = std::min<uint32_t>(255, b * 255 / a);
+                    g = std::min<uint32_t>(255, g * 255 / a);
+                    r = std::min<uint32_t>(255, r * 255 / a);
+                }
+                put32(image, (a << 24) | (r << 16) | (g << 8) | b);
+            }
+        }
+        image.append(maskRow * size, '\0');
+
+        entries.push_back((char)(size >= 256 ? 0 : size));
+        entries.push_back((char)(size >= 256 ? 0 : size));
+        entries.push_back(0);
+        entries.push_back(0);
+        put16(entries, 1);
+        put16(entries, 32);
+        put32(entries, (uint32_t)image.size());
+        put32(entries, offset);
+        offset += (uint32_t)image.size();
+        images += image;
+    }
+
+    std::string data = header + entries + images;
+    HANDLE file = CreateFile(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD written = 0;
+    bool ok = WriteFile(file, data.data(), (DWORD)data.size(), &written,
+                        nullptr) &&
+              written == data.size();
+    CloseHandle(file);
+    if (!ok) {
+        DeleteFile(path.c_str());
+    }
+    return ok;
+}
+
+std::wstring DesktopIniPath(const std::wstring& folder) {
+    return folder + L"\\desktop.ini";
+}
+
+std::wstring ReadIni(const std::wstring& folder, PCWSTR key) {
+    WCHAR value[MAX_PATH * 2] = L"";
+    GetPrivateProfileString(L".ShellClassInfo", key, L"", value,
+                            ARRAYSIZE(value), DesktopIniPath(folder).c_str());
+    return value;
+}
+
+// The folder's current custom icon as "file,index", or empty.
+std::wstring ReadFolderIcon(const std::wstring& folder) {
+    std::wstring icon = ReadIni(folder, L"IconResource");
+    if (icon.empty()) {
+        std::wstring file = ReadIni(folder, L"IconFile");
+        if (!file.empty()) {
+            std::wstring index = ReadIni(folder, L"IconIndex");
+            icon = file + L"," + (index.empty() ? L"0" : index);
+        }
+    }
+    return icon;
+}
+
+void NotifyFolderChanged(const std::wstring& folder) {
+    SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
+                   folder.c_str(), nullptr);
+}
+
+bool SetFolderIcon(const std::wstring& folder, const std::wstring& icon) {
+    size_t comma = icon.rfind(L',');
+    std::wstring file = comma == std::wstring::npos ? icon : icon.substr(0, comma);
+    int index = comma == std::wstring::npos ? 0 : _wtoi(icon.c_str() + comma + 1);
+
+    SHFOLDERCUSTOMSETTINGS settings{.dwSize = sizeof(settings),
+                                    .dwMask = FCSM_ICONFILE,
+                                    .pszIconFile = file.data(),
+                                    .cchIconFile = 0,
+                                    .iIconIndex = index};
+    bool ok = SUCCEEDED(
+        SHGetSetFolderCustomSettings(&settings, folder.c_str(), FCS_FORCEWRITE));
+    NotifyFolderChanged(folder);
+    return ok;
+}
+
+// Backup value per folder: "<folder attributes>|<desktop.ini existed>|<icon>".
+struct FolderIconBackup {
+    DWORD attributes;
+    bool hadIni;
+    std::wstring icon;
+};
+
+std::wstring FormatBackup(const FolderIconBackup& backup) {
+    return std::to_wstring(backup.attributes) + L"|" +
+           (backup.hadIni ? L"1" : L"0") + L"|" + backup.icon;
+}
+
+FolderIconBackup ParseBackup(const std::wstring& value) {
+    FolderIconBackup backup{FILE_ATTRIBUTE_DIRECTORY, false, L""};
+    size_t first = value.find(L'|');
+    size_t second = first == std::wstring::npos ? first : value.find(L'|', first + 1);
+    if (second != std::wstring::npos) {
+        backup.attributes = (DWORD)_wtoi64(value.substr(0, first).c_str());
+        backup.hadIni = value[first + 1] == L'1';
+        backup.icon = value.substr(second + 1);
+    }
+    return backup;
+}
+
+std::vector<std::pair<std::wstring, std::wstring>> ReadBackups() {
+    std::vector<std::pair<std::wstring, std::wstring>> backups;
+    HKEY key;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, kFolderIconsBackupSubKey, 0, KEY_READ,
+                     &key) != ERROR_SUCCESS) {
+        return backups;
+    }
+    for (DWORD i = 0;; i++) {
+        WCHAR name[MAX_PATH * 2];
+        WCHAR data[MAX_PATH * 3];
+        DWORD nameLen = ARRAYSIZE(name), dataSize = sizeof(data), type;
+        if (RegEnumValue(key, i, name, &nameLen, nullptr, &type, (BYTE*)data,
+                         &dataSize) != ERROR_SUCCESS) {
+            break;
+        }
+        if (type == REG_SZ) {
+            backups.push_back({name, data});
+        }
+    }
+    RegCloseKey(key);
+    return backups;
+}
+
+// Puts back the folder's previous icon, unless the user has set another one
+// since: then the folder is left as it is.
+void RestoreFolderIcon(const std::wstring& folder, const FolderIconBackup& backup) {
+    std::wstring current = ReadFolderIcon(folder);
+    if (!current.empty() && !StartsWithNoCase(current, FolderIconsDir())) {
+        return;
+    }
+
+    if (!backup.icon.empty()) {
+        SetFolderIcon(folder, backup.icon);
+    } else {
+        std::wstring ini = DesktopIniPath(folder);
+        for (PCWSTR key : {L"IconResource", L"IconFile", L"IconIndex"}) {
+            WritePrivateProfileString(L".ShellClassInfo", key, nullptr, ini.c_str());
+        }
+        if (!backup.hadIni) {
+            SetFileAttributes(ini.c_str(), FILE_ATTRIBUTE_NORMAL);
+            DeleteFile(ini.c_str());
+        }
+    }
+
+    SetFileAttributes(folder.c_str(), backup.attributes);
+    NotifyFolderChanged(folder);
+}
+
+// The items shown in a folder's icon: visible files and folders, sorted by
+// name as File Explorer sorts them.
+std::vector<std::wstring> ListFolderItems(const std::wstring& folder,
+                                      std::wstring* signature) {
+    std::vector<std::pair<std::wstring, FILETIME>> found;
+    WIN32_FIND_DATA data;
+    HANDLE find = FindFirstFile((folder + L"\\*").c_str(), &data);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(data.cFileName, L".") == 0 ||
+                wcscmp(data.cFileName, L"..") == 0 ||
+                (data.dwFileAttributes &
+                 (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))) {
+                continue;
+            }
+            found.push_back({data.cFileName, data.ftLastWriteTime});
+        } while (FindNextFile(find, &data));
+        FindClose(find);
+    }
+
+    std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) {
+        return StrCmpLogicalW(a.first.c_str(), b.first.c_str()) < 0;
+    });
+
+    std::vector<std::wstring> items;
+    signature->clear();
+    for (size_t i = 0; i < found.size() && i < kFolderIconMaxItems; i++) {
+        items.push_back(folder + L"\\" + found[i].first);
+        *signature += found[i].first + L"|" +
+                      std::to_wstring(found[i].second.dwLowDateTime) + L"|";
+    }
+    return items;
+}
+
+std::vector<std::wstring> DesktopDirs() {
+    std::vector<std::wstring> dirs;
+    for (REFKNOWNFOLDERID id : {FOLDERID_Desktop, FOLDERID_PublicDesktop}) {
+        PWSTR path = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(id, 0, nullptr, &path))) {
+            dirs.push_back(path);
+        }
+        CoTaskMemFree(path);
+    }
+    return dirs;
+}
+
+// Desktop folders that can get an icon: not hidden, and not special folders
+// (a CLSID in desktop.ini).
+std::vector<std::wstring> DesktopFolders() {
+    std::vector<std::wstring> folders;
+    for (const auto& dir : DesktopDirs()) {
+        WIN32_FIND_DATA data;
+        HANDLE find = FindFirstFile((dir + L"\\*").c_str(), &data);
+        if (find == INVALID_HANDLE_VALUE) {
+            continue;
+        }
+        do {
+            if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+                (data.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) ||
+                wcscmp(data.cFileName, L".") == 0 ||
+                wcscmp(data.cFileName, L"..") == 0) {
+                continue;
+            }
+            std::wstring folder = dir + L"\\" + data.cFileName;
+            if (ReadIni(folder, L"CLSID").empty() &&
+                ReadIni(folder, L"CLSID2").empty()) {
+                folders.push_back(folder);
+            }
+        } while (FindNextFile(find, &data));
+        FindClose(find);
+    }
+    return folders;
+}
+
+void DeleteUnusedFolderIconFiles(const std::vector<std::wstring>& used) {
+    std::wstring dir = FolderIconsDir();
+    WIN32_FIND_DATA data;
+    HANDLE find = FindFirstFile((dir + L"\\*.ico").c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    do {
+        std::wstring path = dir + L"\\" + data.cFileName;
+        bool inUse = std::any_of(used.begin(), used.end(), [&](const auto& u) {
+            return CompareStringOrdinal(u.c_str(), -1, path.c_str(), -1, TRUE) ==
+                   CSTR_EQUAL;
+        });
+        if (!inUse) {
+            DeleteFile(path.c_str());
+        }
+    } while (FindNextFile(find, &data));
+    FindClose(find);
+}
+
+void ApplyFolderIcons() {
+    std::wstring dir = FolderIconsDir();
+    if (dir.empty() || SHCreateDirectoryEx(nullptr, dir.c_str(), nullptr) ==
+                           ERROR_PATH_NOT_FOUND) {
+        return;
+    }
+
+    auto backups = ReadBackups();
+    auto hasBackup = [&](const std::wstring& folder) {
+        return std::any_of(backups.begin(), backups.end(), [&](const auto& b) {
+            return CompareStringOrdinal(b.first.c_str(), -1, folder.c_str(), -1,
+                                        TRUE) == CSTR_EQUAL;
+        });
+    };
+
+    std::vector<std::wstring> handled, usedIcons;
+    for (const auto& folder : DesktopFolders()) {
+        std::wstring signature;
+        std::vector<std::wstring> items = ListFolderItems(folder, &signature);
+        if (items.empty()) {
+            continue;
+        }
+
+        WCHAR hash[17];
+        swprintf(hash, ARRAYSIZE(hash), L"%016llx",
+                 (unsigned long long)Fnv1a(ToLower(folder) + L"|" + signature));
+        std::wstring iconPath = dir + L"\\" + hash + L".ico";
+        std::wstring icon = iconPath + L",0";
+        std::wstring current = ReadFolderIcon(folder);
+
+        if (CompareStringOrdinal(current.c_str(), -1, icon.c_str(), -1, TRUE) ==
+                CSTR_EQUAL &&
+            GetFileAttributes(iconPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            handled.push_back(folder);
+            usedIcons.push_back(iconPath);
+            continue;
+        }
+
+        if (!hasBackup(folder)) {
+            FolderIconBackup backup{
+                GetFileAttributes(folder.c_str()),
+                GetFileAttributes(DesktopIniPath(folder).c_str()) !=
+                    INVALID_FILE_ATTRIBUTES,
+                StartsWithNoCase(current, dir) ? L"" : current};
+            std::wstring value = FormatBackup(backup);
+            if (RegSetKeyValue(HKEY_CURRENT_USER, kFolderIconsBackupSubKey,
+                               folder.c_str(), REG_SZ, value.c_str(),
+                               (DWORD)((value.size() + 1) * sizeof(WCHAR))) !=
+                ERROR_SUCCESS) {
+                continue;
+            }
+            backups.push_back({folder, value});
+        }
+
+        if (GetFileAttributes(iconPath.c_str()) == INVALID_FILE_ATTRIBUTES &&
+            !WriteFolderIconFile(iconPath, items)) {
+            continue;
+        }
+
+        // Folders where it can't be written (the public desktop needs
+        // administrator rights) keep their icon.
+        if (SetFolderIcon(folder, icon)) {
+            handled.push_back(folder);
+            usedIcons.push_back(iconPath);
+            DebugLog(L"Folder icon set: %s", folder.c_str());
+        }
+    }
+
+    // Folders that are gone from the desktop, emptied, or couldn't be set get
+    // their previous icon back.
+    for (const auto& [folder, value] : backups) {
+        bool isHandled = std::any_of(handled.begin(), handled.end(), [&](const auto& h) {
+            return CompareStringOrdinal(h.c_str(), -1, folder.c_str(), -1, TRUE) ==
+                   CSTR_EQUAL;
+        });
+        if (!isHandled) {
+            if (GetFileAttributes(folder.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                RestoreFolderIcon(folder, ParseBackup(value));
+            }
+            RegDeleteKeyValue(HKEY_CURRENT_USER, kFolderIconsBackupSubKey,
+                              folder.c_str());
+        }
+    }
+
+    DeleteUnusedFolderIconFiles(usedIcons);
+}
+
+void RemoveFolderIcons() {
+    auto backups = ReadBackups();
+    for (const auto& [folder, value] : backups) {
+        if (GetFileAttributes(folder.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            RestoreFolderIcon(folder, ParseBackup(value));
+        }
+    }
+    if (!backups.empty()) {
+        DebugLog(L"Folder icons removed: %d", (int)backups.size());
+    }
+    RegDeleteTree(HKEY_CURRENT_USER, kFolderIconsBackupSubKey);
+    RegDeleteKey(HKEY_CURRENT_USER, kFolderIconsBackupSubKey);
+
+    std::wstring dir = FolderIconsDir();
+    if (!dir.empty()) {
+        DeleteUnusedFolderIconFiles({});
+        RemoveDirectory(dir.c_str());
+        RemoveDirectory((dir.substr(0, dir.rfind(L'\\'))).c_str());
+    }
+}
+
+void SyncFolderIcons() {
+    if (!g_unloading && IsActive() && g_settings.folderIcons) {
+        ApplyFolderIcons();
+    } else {
+        RemoveFolderIcons();
+    }
+}
+
+// Watches the desktop folders (both desktops, with their subfolders) and the
+// settings; changes are applied once they settle.
+DWORD WINAPI FolderIconsThreadProc(LPVOID) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    struct Watch {
+        HANDLE dir;
+        HANDLE event;
+        OVERLAPPED overlapped;
+        alignas(DWORD) BYTE buffer[16 * 1024];
+    };
+    std::vector<std::unique_ptr<Watch>> watches;
+    for (const auto& path : DesktopDirs()) {
+        HANDLE dir = CreateFile(path.c_str(), FILE_LIST_DIRECTORY,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING,
+                                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+                                nullptr);
+        if (dir == INVALID_HANDLE_VALUE) {
+            continue;
+        }
+        auto watch = std::make_unique<Watch>();
+        watch->dir = dir;
+        watch->event = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        watches.push_back(std::move(watch));
+    }
+
+    auto arm = [](Watch& watch) {
+        ResetEvent(watch.event);
+        watch.overlapped = {};
+        watch.overlapped.hEvent = watch.event;
+        ReadDirectoryChangesW(
+            watch.dir, watch.buffer, sizeof(watch.buffer), TRUE,
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                FILE_NOTIFY_CHANGE_LAST_WRITE,
+            nullptr, &watch.overlapped, nullptr);
+    };
+    for (auto& watch : watches) {
+        arm(*watch);
+    }
+
+    std::vector<HANDLE> events{g_folderIconsStopEvent, g_folderIconsChangedEvent};
+    for (auto& watch : watches) {
+        events.push_back(watch->event);
+    }
+
+    SyncFolderIcons();
+
+    ULONGLONG due = 0;
+    while (true) {
+        DWORD timeout = INFINITE;
+        if (due) {
+            ULONGLONG now = GetTickCount64();
+            timeout = due > now ? (DWORD)(due - now) : 0;
+        }
+        DWORD wait = WaitForMultipleObjects((DWORD)events.size(), events.data(),
+                                            FALSE, timeout);
+        if (wait == WAIT_OBJECT_0 || wait == WAIT_FAILED) {
+            break;
+        }
+        if (wait == WAIT_TIMEOUT) {
+            due = 0;
+            SyncFolderIcons();
+            continue;
+        }
+        if (wait >= WAIT_OBJECT_0 + 2) {
+            Watch& watch = *watches[wait - WAIT_OBJECT_0 - 2];
+            DWORD bytes;
+            GetOverlappedResult(watch.dir, &watch.overlapped, &bytes, FALSE);
+            arm(watch);
+        }
+        due = GetTickCount64() + kFolderIconsDebounce;
+    }
+
+    for (auto& watch : watches) {
+        CancelIoEx(watch->dir, &watch->overlapped);
+        DWORD bytes;
+        GetOverlappedResult(watch->dir, &watch->overlapped, &bytes, TRUE);
+        CloseHandle(watch->dir);
+        CloseHandle(watch->event);
+    }
+
+    // Unloading: the folders get their previous icons back.
+    RemoveFolderIcons();
+    CoUninitialize();
+    return 0;
+}
+
+void StartFolderIconsThread() {
+    g_folderIconsStopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    g_folderIconsChangedEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    g_folderIconsThread =
+        CreateThread(nullptr, 0, FolderIconsThreadProc, nullptr, 0, nullptr);
+}
+
+void StopFolderIconsThread() {
+    if (g_folderIconsThread) {
+        SetEvent(g_folderIconsStopEvent);
+        WaitForSingleObject(g_folderIconsThread, INFINITE);
+        CloseHandle(g_folderIconsThread);
+        g_folderIconsThread = nullptr;
+    }
+    for (HANDLE* event : {&g_folderIconsStopEvent, &g_folderIconsChangedEvent}) {
+        if (*event) {
+            CloseHandle(*event);
+            *event = nullptr;
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Settings window
 //
 // Opened by the settings button. It runs on its own thread, with its own XAML
@@ -2184,6 +2941,16 @@ constexpr SettingsText kSettingsTexts[] = {
      L"apps with a window on its display",
      L"L'impostazione di Windows per più schermi: ogni barra delle "
      L"applicazioni mostra solo le app con una finestra sul suo schermo"},
+
+    {L"Miscellaneous", L"Miscellaneous", L"Varie"},
+    {L"FolderIcons", L"iOS-style folder icons",
+     L"Icone delle cartelle in stile iOS"},
+    {L"FolderIconsDesc",
+     L"Desktop folders show the icons of what's inside, up to 9, on the iOS "
+     L"app icon shape. Turning it off brings back the previous icons",
+     L"Le cartelle del desktop mostrano le icone di quello che contengono, "
+     L"fino a 9, nella forma delle icone delle app di iOS. Disattivandola "
+     L"tornano le icone di prima"},
 
     {L"Size", L"Size", L"Dimensioni"},
     {L"DynamicWidth", L"Dynamic width", L"Larghezza dinamica"},
@@ -2265,6 +3032,7 @@ constexpr PCWSTR kResettableSettings[] = {
     L"enabled", L"material",          L"border", L"roundedCorners",
     L"dynamicWidth", L"width",        L"padding", L"animationDuration",
     L"margin",  L"settingsButton",    L"hiddenIconMenu", L"checkUpdates",
+    L"folderIcons",
     L"debugLog",
 };
 
@@ -2454,6 +3222,9 @@ std::wstring SettingsPageXaml() {
     xaml += SectionXaml(L"Animation");
     xaml += CardXaml(L"Duration", L"E823", SliderXaml(L"Duration", 50, 1000, 10));
 
+    xaml += SectionXaml(L"Miscellaneous");
+    xaml += CardXaml(L"FolderIcons", L"E8B7", ToggleXaml(L"FolderIcons"));
+
     xaml += SectionXaml(L"General");
     xaml += CardXaml(L"Language", L"F2B7",
                      LR"(<ComboBox x:Name="LanguageCombo" MinWidth="160"/>)");
@@ -2556,6 +3327,7 @@ void SetCardEnabled(PCWSTR name, const std::wstring& controlName, bool enabled) 
 // Settings that only matter when another one is on.
 void UpdateSettingsUiStates() {
     bool enabled = FindToggle(L"Enabled").IsOn();
+    SetCardEnabled(L"FolderIcons", L"FolderIconsToggle", enabled);
     bool defaultMaterial = SelectedTag(L"MaterialCombo") == L"default";
     bool dynamicWidth = FindToggle(L"DynamicWidth").IsOn();
 
@@ -2700,6 +3472,8 @@ void LoadSettingsUi() {
     SetCardTexts(L"Padding", Text(L"Padding"), Text(L"PaddingDesc"));
     SetSettingsText(L"AnimationSection", Text(L"Animation"));
     SetCardTexts(L"Duration", Text(L"Duration"), Text(L"DurationDesc"));
+    SetSettingsText(L"MiscellaneousSection", Text(L"Miscellaneous"));
+    SetCardTexts(L"FolderIcons", Text(L"FolderIcons"), Text(L"FolderIconsDesc"));
     SetSettingsText(L"GeneralSection", Text(L"General"));
     SetCardTexts(L"Language", Text(L"Language"), Text(L"LanguageDesc"));
     SetCardTexts(L"DebugLog", Text(L"DebugLog"),
@@ -2720,7 +3494,7 @@ void LoadSettingsUi() {
 
     for (PCWSTR name : {L"Enabled", L"RoundedCorners", L"Border",
                         L"SettingsButton", L"HiddenIconMenu", L"AppsWhereOpen",
-                        L"DynamicWidth",
+                        L"DynamicWidth", L"FolderIcons",
                         L"CheckUpdates", L"DebugLog"}) {
         auto toggle = FindToggle(name);
         toggle.OnContent(winrt::box_value(winrt::hstring(Text(L"On"))));
@@ -2748,6 +3522,7 @@ void LoadSettingsUi() {
     FindToggle(L"AppsWhereOpen").IsOn(IsTaskbarAppsWhereWindowOpen());
     FindToggle(L"DynamicWidth").IsOn(settings.dynamicWidth);
     FindToggle(L"CheckUpdates").IsOn(settings.checkUpdates);
+    FindToggle(L"FolderIcons").IsOn(settings.folderIcons);
     FindToggle(L"DebugLog").IsOn(settings.debugLog);
     FindSlider(L"Width").Value(settings.width);
     FindSlider(L"Padding").Value(settings.padding);
@@ -2793,6 +3568,7 @@ void ConnectSettingsUi() {
     ConnectToggle(L"DynamicWidth", L"dynamicWidth");
     ConnectToggle(L"CheckUpdates", L"checkUpdates");
     ConnectToggle(L"HiddenIconMenu", L"hiddenIconMenu");
+    ConnectToggle(L"FolderIcons", L"folderIcons");
     ConnectToggle(L"DebugLog", L"debugLog");
     ConnectSlider(L"Margin", L"margin");
     ConnectSlider(L"Width", L"width");
@@ -3254,6 +4030,10 @@ void ReloadSettings() {
     }
 
     ApplySettings();
+
+    if (g_folderIconsChangedEvent) {
+        SetEvent(g_folderIconsChangedEvent);
+    }
 }
 
 // Applies changes made by the settings window as soon as they're written.
@@ -3850,6 +4630,7 @@ void Wh_ModAfterInit() {
 
     StartSettingsWatcher();
     StartUpdateThread();
+    StartFolderIconsThread();
 }
 
 void Wh_ModBeforeUninit() {
@@ -3858,6 +4639,7 @@ void Wh_ModBeforeUninit() {
     // The watcher first: the link can't open the window again while it closes.
     StopSettingsWatcher();
     StopUpdateThread();
+    StopFolderIconsThread();
     CloseSettingsWindow();
     UnregisterSettingsLink();
 

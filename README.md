@@ -27,6 +27,10 @@ and Transparency effects. A button on the taskbar, before the clock, opens the
 Fluent Experience settings, and Fluent Experience tells you when a new version
 is available.
 
+An optional setting, off by default, gives the folders on your desktop an
+iOS-style icon: the icons of what's inside, up to 9, on the iOS app icon
+shape. Turning it off brings back the previous icons.
+
 Windows settings still apply: "Show smaller taskbar buttons" and "Animation
 effects" work as on the original taskbar. Every feature can be turned off;
 turning Fluent Experience off restores the original Windows taskbar.
