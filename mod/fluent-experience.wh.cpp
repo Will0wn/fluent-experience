@@ -2,7 +2,7 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.19.5
+// @version         0.20
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
@@ -1182,17 +1182,235 @@ int WINAPI NotificationAreaOverflow_MeasureOverride_Hook(
     return ret;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Symbols
+//
+// Functions are found by their symbol names, which stay the same across
+// Windows updates. Windhawk reads them from Microsoft's symbols. For a Windows
+// build whose symbols Microsoft hasn't published yet, Windhawk's online symbol
+// cache serves symbols ported from earlier builds, but only to mods published
+// in the Windhawk catalog. So when the symbols can't be found, the mod reads
+// that cache as published for catalog mods that use the same functions.
+//
+// Only while the mod is installed as a local mod: once published in the
+// catalog, Windhawk uses the cache for it directly and this part never runs.
+// It can then be removed (HookSymbolsFromCatalogCache, GetSymbolCacheKey).
+
+struct SymbolHook {
+    PCWSTR symbol;
+    void** original;
+    void* hook;  // nullptr: only the address is needed.
+    bool optional;
+};
+
+constexpr PCWSTR kSymbolCacheUrl =
+    L"https://ramensoftware.github.io/windhawk-mod-symbol-cache/";
+
+// The cache key Windhawk uses for a module: its PDB identifier.
+bool GetSymbolCacheKey(HMODULE module, std::wstring* key) {
+    auto* base = (const BYTE*)module;
+    auto* dos = (const IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return false;
+    }
+    auto* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        return false;
+    }
+
+    const IMAGE_DATA_DIRECTORY& dir =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+    auto* entries = (const IMAGE_DEBUG_DIRECTORY*)(base + dir.VirtualAddress);
+    size_t count = dir.VirtualAddress ? dir.Size / sizeof(*entries) : 0;
+
+    struct CodeViewInfo {
+        DWORD signature;  // "RSDS"
+        GUID guid;
+        DWORD age;
+    };
+
+    for (size_t i = 0; i < count; i++) {
+        if (entries[i].Type != IMAGE_DEBUG_TYPE_CODEVIEW ||
+            !entries[i].AddressOfRawData ||
+            entries[i].SizeOfData < sizeof(CodeViewInfo)) {
+            continue;
+        }
+        auto* cv = (const CodeViewInfo*)(base + entries[i].AddressOfRawData);
+        if (cv->signature != 0x53445352) {
+            continue;
+        }
+        const GUID& g = cv->guid;
+        WCHAR id[64];
+        swprintf_s(id, L"pdb_%08X%04X%04X%02X%02X%02X%02X%02X%02X%02X%02X%x",
+                   g.Data1, g.Data2, g.Data3, g.Data4[0], g.Data4[1],
+                   g.Data4[2], g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6],
+                   g.Data4[7], cv->age);
+        *key = id;
+        return true;
+    }
+
+    return false;
+}
+
+// Reads the symbols from the cache of the given catalog mods, each one from
+// the first mod that has it, and sets the hooks.
+bool HookSymbolsFromCatalogCache(HMODULE module,
+                                 const SymbolHook* hooks,
+                                 size_t count,
+                                 std::initializer_list<PCWSTR> catalogMods) {
+    std::wstring key;
+    if (!GetSymbolCacheKey(module, &key)) {
+        DebugLog(L"No symbol cache key");
+        return false;
+    }
+
+    auto* nt = (const IMAGE_NT_HEADERS*)((const BYTE*)module +
+                                         ((const IMAGE_DOS_HEADER*)module)
+                                             ->e_lfanew);
+    DWORD imageSize = nt->OptionalHeader.SizeOfImage;
+
+    // The cache is ASCII, like the symbol names.
+    std::vector<std::string> names(count);
+    for (size_t i = 0; i < count; i++) {
+        for (PCWSTR p = hooks[i].symbol; *p; p++) {
+            names[i] += (char)*p;
+        }
+    }
+
+    std::vector<void*> addresses(count, nullptr);
+    auto allFound = [&] {
+        for (size_t i = 0; i < count; i++) {
+            if (!addresses[i]) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    for (PCWSTR mod : catalogMods) {
+        if (allFound()) {
+            break;
+        }
+
+        std::wstring url = kSymbolCacheUrl;
+        url += mod;
+        url += L'/';
+        url += key;
+        url += L".txt";
+        const WH_URL_CONTENT* content = Wh_GetUrlContent(url.c_str(), nullptr);
+        if (!content) {
+            DebugLog(L"Symbol cache unreachable: %s", mod);
+            continue;
+        }
+        DebugLog(L"Symbol cache %s: %d", mod, content->statusCode);
+
+        // Format: version#module#key#symbol#offset#symbol#offset...
+        if (content->statusCode == 200 && content->data) {
+            std::string_view text(content->data, content->length);
+            std::vector<std::string_view> parts;
+            size_t start = 0;
+            while (start <= text.size()) {
+                size_t end = text.find('#', start);
+                if (end == std::string_view::npos) {
+                    end = text.size();
+                }
+                parts.push_back(text.substr(start, end - start));
+                start = end + 1;
+            }
+
+            if (parts.size() > 3 && parts[0] == "1") {
+                for (size_t j = 3; j + 1 < parts.size(); j += 2) {
+                    std::string_view offsetText = parts[j + 1];
+                    if (offsetText.empty()) {
+                        continue;
+                    }
+                    for (size_t i = 0; i < count; i++) {
+                        if (addresses[i] || parts[j] != names[i]) {
+                            continue;
+                        }
+                        ULONGLONG offset = 0;
+                        bool valid = true;
+                        for (char c : offsetText) {
+                            if (c < '0' || c > '9') {
+                                valid = false;
+                                break;
+                            }
+                            offset = offset * 10 + (c - '0');
+                        }
+                        if (valid && offset && offset < imageSize) {
+                            addresses[i] = (BYTE*)module + offset;
+                        }
+                    }
+                }
+            }
+        }
+
+        Wh_FreeUrlContent(content);
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        if (!addresses[i] && !hooks[i].optional) {
+            DebugLog(L"Not in the symbol cache: %s", hooks[i].symbol);
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        // Skip what Windhawk already found.
+        if (!addresses[i] || *hooks[i].original) {
+            continue;
+        }
+        if (!hooks[i].hook) {
+            *hooks[i].original = addresses[i];
+        } else if (!Wh_SetFunctionHook(addresses[i], hooks[i].hook,
+                                       hooks[i].original)) {
+            DebugLog(L"Hook failed: %s", hooks[i].symbol);
+            return false;
+        }
+    }
+
+    DebugLog(L"Symbols from the Windhawk symbol cache");
+    return true;
+}
+
+bool HookSymbolsWithCatalogFallback(HMODULE module,
+                                    const SymbolHook* hooks,
+                                    size_t count,
+                                    std::initializer_list<PCWSTR> catalogMods) {
+    std::vector<WindhawkUtils::SYMBOL_HOOK> symbolHooks;
+    symbolHooks.reserve(count);
+    for (size_t i = 0; i < count; i++) {
+        symbolHooks.emplace_back(
+            std::initializer_list<std::wstring_view>{hooks[i].symbol},
+            hooks[i].original, hooks[i].hook, hooks[i].optional);
+    }
+
+    if (WindhawkUtils::HookSymbols(module, symbolHooks.data(),
+                                   symbolHooks.size())) {
+        return true;
+    }
+
+    if (!std::wstring_view(WH_MOD_ID).starts_with(L"local@")) {
+        return false;
+    }
+
+    DebugLog(L"Symbols not found, trying the Windhawk symbol cache");
+    return catalogMods.size() &&
+           HookSymbolsFromCatalogCache(module, hooks, count, catalogMods);
+}
+
 bool HookSystemTrayDllSymbols(HMODULE module) {
-    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
+    // No catalog mod uses this function: without it, only the hidden icon
+    // menu keeps Windows' own size.
+    SymbolHook hooks[] = {
         {
-            {LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::SystemTray::implementation::NotificationAreaOverflow,struct winrt::Windows::UI::Xaml::IFrameworkElementOverrides>::MeasureOverride(struct winrt::Windows::Foundation::Size,struct winrt::Windows::Foundation::Size *))"},
-            &NotificationAreaOverflow_MeasureOverride_Original,
-            NotificationAreaOverflow_MeasureOverride_Hook,
+            LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::SystemTray::implementation::NotificationAreaOverflow,struct winrt::Windows::UI::Xaml::IFrameworkElementOverrides>::MeasureOverride(struct winrt::Windows::Foundation::Size,struct winrt::Windows::Foundation::Size *))",
+            (void**)&NotificationAreaOverflow_MeasureOverride_Original,
+            (void*)NotificationAreaOverflow_MeasureOverride_Hook,
         },
     };
 
-    return WindhawkUtils::HookSymbols(module, symbolHooks,
-                                      ARRAYSIZE(symbolHooks));
+    return HookSymbolsWithCatalogFallback(module, hooks, ARRAYSIZE(hooks), {});
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1912,16 +2130,17 @@ int WINAPI TaskbarFrame_MeasureOverride_Hook(
 }
 
 bool HookTaskbarViewDllSymbols(HMODULE module) {
-    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
+    SymbolHook hooks[] = {
         {
-            {LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::Taskbar::implementation::TaskbarFrame,struct winrt::Windows::UI::Xaml::IFrameworkElementOverrides>::MeasureOverride(struct winrt::Windows::Foundation::Size,struct winrt::Windows::Foundation::Size *))"},
-            &TaskbarFrame_MeasureOverride_Original,
-            TaskbarFrame_MeasureOverride_Hook,
+            LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::Taskbar::implementation::TaskbarFrame,struct winrt::Windows::UI::Xaml::IFrameworkElementOverrides>::MeasureOverride(struct winrt::Windows::Foundation::Size,struct winrt::Windows::Foundation::Size *))",
+            (void**)&TaskbarFrame_MeasureOverride_Original,
+            (void*)TaskbarFrame_MeasureOverride_Hook,
         },
     };
 
-    return WindhawkUtils::HookSymbols(module, symbolHooks,
-                                      ARRAYSIZE(symbolHooks));
+    return HookSymbolsWithCatalogFallback(
+        module, hooks, ARRAYSIZE(hooks),
+        {L"taskbar-icon-size", L"taskbar-vertical"});
 }
 
 HMODULE GetTaskbarViewModuleHandle() {
@@ -2176,93 +2395,48 @@ bool HookTaskbarDllSymbols() {
         DebugLog(L"Failed to load taskbar.dll");
         return false;
     }
-    DebugLog(L"taskbar.dll loaded");
 
-    WindhawkUtils::SYMBOL_HOOK taskbarDllHooks[] = {
+    SymbolHook hooks[] = {
         {
-            {LR"(public: void __cdecl TrayUI::_StuckTrayChange(void))"},
-            &TrayUI__StuckTrayChange_Original,
+            LR"(public: void __cdecl TrayUI::_StuckTrayChange(void))",
+            (void**)&TrayUI__StuckTrayChange_Original,
         },
         {
-            {LR"(public: void __cdecl TrayUI::_HandleSettingChange(struct HWND__ *,unsigned int,unsigned __int64,__int64))"},
-            &TrayUI__HandleSettingChange_Original,
-            TrayUI__HandleSettingChange_Hook,
+            LR"(public: void __cdecl TrayUI::_HandleSettingChange(struct HWND__ *,unsigned int,unsigned __int64,__int64))",
+            (void**)&TrayUI__HandleSettingChange_Original,
+            (void*)TrayUI__HandleSettingChange_Hook,
         },
         {
-            {LR"(public: virtual unsigned int __cdecl TrayUI::GetDockedRect(struct tagRECT *,int))"},
-            &TrayUI_GetDockedRect_Original,
-            TrayUI_GetDockedRect_Hook,
+            LR"(public: virtual unsigned int __cdecl TrayUI::GetDockedRect(struct tagRECT *,int))",
+            (void**)&TrayUI_GetDockedRect_Original,
+            (void*)TrayUI_GetDockedRect_Hook,
         },
         {
-            {LR"(public: virtual void __cdecl TrayUI::MakeStuckRect(struct tagRECT *,struct tagRECT const *,struct tagSIZE,unsigned int))"},
-            &TrayUI_MakeStuckRect_Original,
-            TrayUI_MakeStuckRect_Hook,
+            LR"(public: virtual void __cdecl TrayUI::MakeStuckRect(struct tagRECT *,struct tagRECT const *,struct tagSIZE,unsigned int))",
+            (void**)&TrayUI_MakeStuckRect_Original,
+            (void*)TrayUI_MakeStuckRect_Hook,
         },
         {
-            {LR"(public: virtual __int64 __cdecl TrayUI::WndProc(struct HWND__ *,unsigned int,unsigned __int64,__int64,bool *))"},
-            &TrayUI_WndProc_Original,
-            TrayUI_WndProc_Hook,
+            LR"(public: virtual __int64 __cdecl TrayUI::WndProc(struct HWND__ *,unsigned int,unsigned __int64,__int64,bool *))",
+            (void**)&TrayUI_WndProc_Original,
+            (void*)TrayUI_WndProc_Hook,
         },
         {
-            {LR"(private: virtual __int64 __cdecl CSecondaryTray::v_WndProc(struct HWND__ *,unsigned int,unsigned __int64,__int64))"},
-            &CSecondaryTray_v_WndProc_Original,
-            CSecondaryTray_v_WndProc_Hook,
+            LR"(private: virtual __int64 __cdecl CSecondaryTray::v_WndProc(struct HWND__ *,unsigned int,unsigned __int64,__int64))",
+            (void**)&CSecondaryTray_v_WndProc_Original,
+            (void*)CSecondaryTray_v_WndProc_Hook,
         },
         {
-            {LR"(private: void __cdecl CSecondaryTray::_ComputeHiddenRect(struct tagRECT *))"},
-            &CSecondaryTray__ComputeHiddenRect_Original,
-            CSecondaryTray__ComputeHiddenRect_Hook,
+            LR"(private: void __cdecl CSecondaryTray::_ComputeHiddenRect(struct tagRECT *))",
+            (void**)&CSecondaryTray__ComputeHiddenRect_Original,
+            (void*)CSecondaryTray__ComputeHiddenRect_Hook,
             true,  // Only needed for auto-hide on secondary monitors.
         },
     };
 
-    // One symbol at a time, so the log names the one that stops or fails.
-    // Same order as taskbarDllHooks; only the last one is optional.
-    PCWSTR names[] = {
-        L"TrayUI::_StuckTrayChange",    L"TrayUI::_HandleSettingChange",
-        L"TrayUI::GetDockedRect",       L"TrayUI::MakeStuckRect",
-        L"TrayUI::WndProc",             L"CSecondaryTray::v_WndProc",
-        L"CSecondaryTray::_ComputeHiddenRect",
-    };
-    static_assert(ARRAYSIZE(names) == ARRAYSIZE(taskbarDllHooks));
-    bool ok = true;
-    for (size_t i = 0; i < ARRAYSIZE(taskbarDllHooks); i++) {
-        DebugLog(L"Hooking %s", names[i]);
-        bool hooked =
-            WindhawkUtils::HookSymbols(module, &taskbarDllHooks[i], 1);
-        DebugLog(L"%s: %s", hooked ? L"Hooked" : L"Not found", names[i]);
-        if (!hooked && i != ARRAYSIZE(taskbarDllHooks) - 1) {
-            ok = false;
-        }
-    }
-
-    if (!ok) {
-        // Diagnostics: how many symbols Windhawk sees in taskbar.dll, and the
-        // names that look like ours.
-        PCWSTR keys[] = {L"StuckTrayChange", L"HandleSettingChange",
-                         L"GetDockedRect",   L"MakeStuckRect",
-                         L"WndProc",         L"ComputeHiddenRect"};
-        size_t total = 0, shown = 0;
-        WH_FIND_SYMBOL symbol;
-        if (HANDLE search = Wh_FindFirstSymbol(module, nullptr, &symbol)) {
-            do {
-                total++;
-                PCWSTR name = symbol.symbol ? symbol.symbol : L"";
-                bool tray = wcsstr(name, L"TrayUI") ||
-                            wcsstr(name, L"SecondaryTray");
-                for (PCWSTR key : keys) {
-                    if (tray && shown < 40 && wcsstr(name, key)) {
-                        DebugLog(L"Symbol: %.900s", name);
-                        shown++;
-                        break;
-                    }
-                }
-            } while (Wh_FindNextSymbol(search, &symbol));
-            Wh_FindCloseSymbol(search);
-        }
-        DebugLog(L"taskbar.dll symbols seen: %zu", total);
-    }
-    return ok;
+    return HookSymbolsWithCatalogFallback(
+        module, hooks, ARRAYSIZE(hooks),
+        {L"taskbar-on-top", L"taskbar-vertical"});
 }
 
 HWND FindCurrentProcessTaskbarWnd() {
