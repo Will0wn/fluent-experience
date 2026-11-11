@@ -2,7 +2,7 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.19.3
+// @version         0.19.4
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
@@ -2173,9 +2173,10 @@ bool HookTaskbarDllSymbols() {
     HMODULE module =
         LoadLibraryEx(L"taskbar.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!module) {
-        Wh_Log(L"Failed to load taskbar.dll");
+        DebugLog(L"Failed to load taskbar.dll");
         return false;
     }
+    DebugLog(L"taskbar.dll loaded");
 
     WindhawkUtils::SYMBOL_HOOK taskbarDllHooks[] = {
         {
@@ -2215,8 +2216,26 @@ bool HookTaskbarDllSymbols() {
         },
     };
 
-    return WindhawkUtils::HookSymbols(module, taskbarDllHooks,
-                                      ARRAYSIZE(taskbarDllHooks));
+    // One symbol at a time, so the log names the one that stops or fails.
+    // Same order as taskbarDllHooks; only the last one is optional.
+    PCWSTR names[] = {
+        L"TrayUI::_StuckTrayChange",    L"TrayUI::_HandleSettingChange",
+        L"TrayUI::GetDockedRect",       L"TrayUI::MakeStuckRect",
+        L"TrayUI::WndProc",             L"CSecondaryTray::v_WndProc",
+        L"CSecondaryTray::_ComputeHiddenRect",
+    };
+    static_assert(ARRAYSIZE(names) == ARRAYSIZE(taskbarDllHooks));
+    bool ok = true;
+    for (size_t i = 0; i < ARRAYSIZE(taskbarDllHooks); i++) {
+        DebugLog(L"Hooking %s", names[i]);
+        bool hooked =
+            WindhawkUtils::HookSymbols(module, &taskbarDllHooks[i], 1);
+        DebugLog(L"%s: %s", hooked ? L"Hooked" : L"Not found", names[i]);
+        if (!hooked && i != ARRAYSIZE(taskbarDllHooks) - 1) {
+            ok = false;
+        }
+    }
+    return ok;
 }
 
 HWND FindCurrentProcessTaskbarWnd() {
@@ -2500,8 +2519,10 @@ std::vector<uint32_t> ComposeFolderIcon(const std::vector<std::wstring>& items,
         if (!GetShellIcon(items[i], cellPx, &icon)) {
             continue;
         }
-        // Row and column in the grid: the integer division is intended.
-        double column = (double)(i % 3), row = (double)(i / 3);
+        // Row and column in the grid, as whole numbers first.
+        size_t columnIndex = i % 3;
+        size_t rowIndex = i / 3;
+        double column = (double)columnIndex, row = (double)rowIndex;
         int left = (int)std::lround(pad + column * (cell + gap));
         int top = (int)std::lround(pad + row * (cell + gap));
         for (int y = 0; y < cellPx; y++) {
@@ -4719,8 +4740,10 @@ BOOL Wh_ModInit() {
     DebugLog(L"Init");
 
     if (!HookTaskbarDllSymbols()) {
+        DebugLog(L"taskbar.dll hooks failed");
         return FALSE;
     }
+    DebugLog(L"taskbar.dll hooks done");
 
     HMODULE systemTrayModule = GetModuleHandle(L"SystemTray.dll");
     if (systemTrayModule) {
