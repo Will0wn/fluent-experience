@@ -2,7 +2,7 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.19.2
+// @version         0.19.3
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
@@ -1265,11 +1265,6 @@ struct TrackedFrame {
     FrameworkElement repeater{nullptr};
     winrt::Windows::Foundation::IInspectable savedRepeaterMargin{nullptr};
     bool repeaterVertical = false;
-    // The Widgets button, as wide as what it shows (see FitWidgetsButton).
-    FrameworkElement widgetsButton{nullptr};
-    FrameworkElement widgetsContent{nullptr};
-    winrt::Windows::Foundation::IInspectable savedWidgetsWidth{nullptr};
-    winrt::event_token widgetsSizeChangedToken{};
 };
 
 // Whether the taskbar frame is laid out vertically (left or right taskbar):
@@ -1333,79 +1328,6 @@ void RestoreStartButton(TrackedFrame& tracked) {
 
     tracked.repeater = nullptr;
     tracked.savedRepeaterMargin = nullptr;
-}
-
-// The Widgets button (weather) of a horizontal taskbar. Windows makes it wider
-// than what it shows, which is unnoticed at the far left of a screen-wide
-// taskbar but leaves a gap before Start on the dock.
-FrameworkElement FindWidgetsButton(FrameworkElement taskbarFrame) {
-    if (IsVerticalFrame(taskbarFrame)) {
-        return nullptr;
-    }
-
-    auto rootGrid = FindChildByName(taskbarFrame, L"RootGrid");
-    auto repeater =
-        rootGrid ? FindChildByName(rootGrid, L"TaskbarFrameRepeater") : nullptr;
-    return repeater ? FindChildByName(repeater, L"AugmentedEntryPointButton")
-                    : nullptr;
-}
-
-void RestoreWidgetsButton(TrackedFrame& tracked) {
-    if (!tracked.widgetsButton) {
-        return;
-    }
-
-    tracked.widgetsContent.SizeChanged(tracked.widgetsSizeChangedToken);
-    if (tracked.savedWidgetsWidth == DependencyProperty::UnsetValue()) {
-        tracked.widgetsButton.ClearValue(FrameworkElement::WidthProperty());
-    } else {
-        tracked.widgetsButton.SetValue(FrameworkElement::WidthProperty(),
-                                       tracked.savedWidgetsWidth);
-    }
-
-    tracked.widgetsButton = nullptr;
-    tracked.widgetsContent = nullptr;
-    tracked.savedWidgetsWidth = nullptr;
-    tracked.widgetsSizeChangedToken = {};
-}
-
-// Makes the Widgets button as wide as its content, with the gap Windows leaves
-// before the content on both sides. Follows the content as it changes.
-void FitWidgetsButton(TrackedFrame& tracked, FrameworkElement taskbarFrame) {
-    auto button = FindWidgetsButton(taskbarFrame);
-    if (button == tracked.widgetsButton) {
-        return;
-    }
-
-    RestoreWidgetsButton(tracked);
-    if (!button) {
-        return;
-    }
-
-    auto content = FindDescendantByName(button, L"AugmentedEntryPointContentGrid");
-    if (!content || content.ActualWidth() <= 0) {
-        return;
-    }
-
-    double inset =
-        content.TransformToVisual(button).TransformPoint({0, 0}).X;
-    if (inset < 0 || inset > 40) {
-        return;
-    }
-
-    tracked.savedWidgetsWidth =
-        button.ReadLocalValue(FrameworkElement::WidthProperty());
-    button.Width(content.ActualWidth() + 2 * inset);
-
-    auto weakButton = winrt::make_weak(button);
-    tracked.widgetsSizeChangedToken = content.SizeChanged(
-        [weakButton, inset](const auto&, const SizeChangedEventArgs& args) {
-            if (auto button = weakButton.get()) {
-                button.Width(args.NewSize().Width + 2 * inset);
-            }
-        });
-    tracked.widgetsButton = button;
-    tracked.widgetsContent = content;
 }
 
 std::vector<TrackedFrame> g_taskbarFrames;
@@ -1663,9 +1585,7 @@ void TrackTaskbarFrame(FrameworkElement taskbarFrame) {
         IsActive() != (bool)tracked->trayFrame ||
         IsActive() != (bool)tracked->repeater ||
         (tracked->repeater &&
-         tracked->repeaterVertical != IsVerticalFrame(taskbarFrame)) ||
-        (IsActive() ? FindWidgetsButton(taskbarFrame) != tracked->widgetsButton
-                    : (bool)tracked->widgetsButton);
+         tracked->repeaterVertical != IsVerticalFrame(taskbarFrame));
 
     if (needsUpdate && !g_frameCustomizationPending.exchange(true)) {
         if (HWND hTaskbarWnd = FindCurrentProcessTaskbarWnd()) {
@@ -1701,11 +1621,9 @@ void ApplyCustomizationsToAllFrames() {
             if (IsActive()) {
                 WatchTraySize(tracked, taskbarFrame);
                 InsetStartButton(tracked, taskbarFrame);
-                FitWidgetsButton(tracked, taskbarFrame);
             } else {
                 UnwatchTraySize(tracked);
                 RestoreStartButton(tracked);
-                RestoreWidgetsButton(tracked);
             }
         } catch (const winrt::hresult_error& ex) {
             DebugLog(L"Error %08X: %s", ex.code().value, ex.message().c_str());
