@@ -2,7 +2,7 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.20
+// @version         0.20.1
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
@@ -1483,6 +1483,12 @@ struct TrackedFrame {
     FrameworkElement repeater{nullptr};
     winrt::Windows::Foundation::IInspectable savedRepeaterMargin{nullptr};
     bool repeaterVertical = false;
+    // The Widgets button, without the space before Start (see
+    // FitWidgetsButton).
+    FrameworkElement widgetsButton{nullptr};
+    FrameworkElement widgetsPanel{nullptr};
+    winrt::Windows::Foundation::IInspectable savedWidgetsMargin{nullptr};
+    int64_t widgetsMarginCallbackToken = 0;
 };
 
 // Whether the taskbar frame is laid out vertically (left or right taskbar):
@@ -1546,6 +1552,87 @@ void RestoreStartButton(TrackedFrame& tracked) {
 
     tracked.repeater = nullptr;
     tracked.savedRepeaterMargin = nullptr;
+}
+
+// The Widgets button (weather) of a horizontal taskbar. Windows makes it wider
+// than what it shows, which is unnoticed at the far left of a screen-wide
+// taskbar but leaves a gap before Start on the dock.
+FrameworkElement FindWidgetsButton(FrameworkElement taskbarFrame) {
+    if (IsVerticalFrame(taskbarFrame)) {
+        return nullptr;
+    }
+
+    auto rootGrid = FindChildByName(taskbarFrame, L"RootGrid");
+    auto repeater =
+        rootGrid ? FindChildByName(rootGrid, L"TaskbarFrameRepeater") : nullptr;
+    return repeater ? FindChildByName(repeater, L"AugmentedEntryPointButton")
+                    : nullptr;
+}
+
+void RestoreWidgetsButton(TrackedFrame& tracked) {
+    if (!tracked.widgetsButton) {
+        return;
+    }
+
+    if (auto panel = tracked.widgetsPanel) {
+        panel.UnregisterPropertyChangedCallback(
+            FrameworkElement::MarginProperty(),
+            tracked.widgetsMarginCallbackToken);
+        if (tracked.savedWidgetsMargin == DependencyProperty::UnsetValue()) {
+            panel.ClearValue(FrameworkElement::MarginProperty());
+        } else {
+            panel.SetValue(FrameworkElement::MarginProperty(),
+                           tracked.savedWidgetsMargin);
+        }
+    }
+
+    tracked.widgetsButton = nullptr;
+    tracked.widgetsPanel = nullptr;
+    tracked.savedWidgetsMargin = nullptr;
+    tracked.widgetsMarginCallbackToken = 0;
+}
+
+// Inside the Widgets button, Windows puts the weather in a panel with a large
+// margin on the right, the space before Start on the dock. Without it, the
+// weather's background sits next to Start's as Start's sits next to Search's:
+// each one is drawn a little inside its own button. The weather keeps its own
+// size. If Windows sets the margin again, it's removed again.
+void FitWidgetsButton(TrackedFrame& tracked, FrameworkElement taskbarFrame) {
+    auto button = FindWidgetsButton(taskbarFrame);
+    if (button == tracked.widgetsButton) {
+        return;
+    }
+
+    RestoreWidgetsButton(tracked);
+    if (!button) {
+        return;
+    }
+
+    tracked.widgetsButton = button;
+
+    auto panel = FindChildByName(button, L"ExperienceToggleButtonRootPanel");
+    if (!panel) {
+        return;
+    }
+
+    auto removeRightMargin = [](FrameworkElement element) {
+        Thickness margin = element.Margin();
+        if (margin.Right != 0) {
+            margin.Right = 0;
+            element.Margin(margin);
+        }
+    };
+
+    tracked.widgetsPanel = panel;
+    tracked.savedWidgetsMargin =
+        panel.ReadLocalValue(FrameworkElement::MarginProperty());
+    removeRightMargin(panel);
+    tracked.widgetsMarginCallbackToken = panel.RegisterPropertyChangedCallback(
+        FrameworkElement::MarginProperty(),
+        [removeRightMargin](const DependencyObject& sender,
+                            const DependencyProperty&) {
+            removeRightMargin(sender.as<FrameworkElement>());
+        });
 }
 
 std::vector<TrackedFrame> g_taskbarFrames;
@@ -1803,7 +1890,9 @@ void TrackTaskbarFrame(FrameworkElement taskbarFrame) {
         IsActive() != (bool)tracked->trayFrame ||
         IsActive() != (bool)tracked->repeater ||
         (tracked->repeater &&
-         tracked->repeaterVertical != IsVerticalFrame(taskbarFrame));
+         tracked->repeaterVertical != IsVerticalFrame(taskbarFrame)) ||
+        (IsActive() ? FindWidgetsButton(taskbarFrame) != tracked->widgetsButton
+                    : (bool)tracked->widgetsButton);
 
     if (needsUpdate && !g_frameCustomizationPending.exchange(true)) {
         if (HWND hTaskbarWnd = FindCurrentProcessTaskbarWnd()) {
@@ -1839,9 +1928,11 @@ void ApplyCustomizationsToAllFrames() {
             if (IsActive()) {
                 WatchTraySize(tracked, taskbarFrame);
                 InsetStartButton(tracked, taskbarFrame);
+                FitWidgetsButton(tracked, taskbarFrame);
             } else {
                 UnwatchTraySize(tracked);
                 RestoreStartButton(tracked);
+                RestoreWidgetsButton(tracked);
             }
         } catch (const winrt::hresult_error& ex) {
             DebugLog(L"Error %08X: %s", ex.code().value, ex.message().c_str());
