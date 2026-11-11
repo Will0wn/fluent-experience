@@ -2,7 +2,7 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.19.4
+// @version         0.19.5
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
@@ -2234,6 +2234,33 @@ bool HookTaskbarDllSymbols() {
         if (!hooked && i != ARRAYSIZE(taskbarDllHooks) - 1) {
             ok = false;
         }
+    }
+
+    if (!ok) {
+        // Diagnostics: how many symbols Windhawk sees in taskbar.dll, and the
+        // names that look like ours.
+        PCWSTR keys[] = {L"StuckTrayChange", L"HandleSettingChange",
+                         L"GetDockedRect",   L"MakeStuckRect",
+                         L"WndProc",         L"ComputeHiddenRect"};
+        size_t total = 0, shown = 0;
+        WH_FIND_SYMBOL symbol;
+        if (HANDLE search = Wh_FindFirstSymbol(module, nullptr, &symbol)) {
+            do {
+                total++;
+                PCWSTR name = symbol.symbol ? symbol.symbol : L"";
+                bool tray = wcsstr(name, L"TrayUI") ||
+                            wcsstr(name, L"SecondaryTray");
+                for (PCWSTR key : keys) {
+                    if (tray && shown < 40 && wcsstr(name, key)) {
+                        DebugLog(L"Symbol: %.900s", name);
+                        shown++;
+                        break;
+                    }
+                }
+            } while (Wh_FindNextSymbol(search, &symbol));
+            Wh_FindCloseSymbol(search);
+        }
+        DebugLog(L"taskbar.dll symbols seen: %zu", total);
     }
     return ok;
 }
