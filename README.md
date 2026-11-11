@@ -18,8 +18,9 @@ of being stuck with a copy of an older design.
 
 The taskbar is actually narrowed and centered, not just clipped, so clicks,
 menus and corners follow it. Each taskbar grows and shrinks to fit its icons,
-on every monitor, and floats a few pixels above the bottom edge of the screen,
-while maximized windows stop above it.
+on every monitor, and floats a few pixels off the edge of the screen it's on,
+bottom, top, left or right as set in Windows, while maximized windows stop
+before it.
 
 It can use the Windows 11 materials, Acrylic, Mica or Mica Alt, with the
 rounded corners and shadow Windows gives windows, following light/dark mode

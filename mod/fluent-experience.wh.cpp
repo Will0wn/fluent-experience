@@ -2,7 +2,7 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.19
+// @version         0.19.1
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
@@ -38,14 +38,14 @@ of being stuck with a copy of an older design.
   clipped. Clicks, menus and corners follow it.
 * **Dynamic width**: each taskbar grows and shrinks on its own to fit its icons,
   on every monitor, animated when Windows animation effects are on.
-* **Floating taskbar**: the taskbar sits a few pixels above the bottom edge of
-  the screen.
+* **Floating taskbar**: the taskbar sits a few pixels off the edge of the
+  screen it's on: bottom, top, left or right, as set in Windows.
 * **Windows materials**: the taskbar can use the Windows 11 materials (Acrylic,
   Mica, Mica Alt) with the rounded corners and shadow Windows gives windows,
   following the light/dark theme and the transparency effects setting. With
   the default background the rounded corners are optional, and the window
   border can be hidden.
-* **Reserved space**: maximized windows stop above the taskbar.
+* **Reserved space**: maximized windows stop before the taskbar.
 * **Settings button**: a button on the taskbar, between the tray icons
   and the clock, opens the Fluent Experience settings window.
 * **iOS-style folder icons** (optional, off by default): desktop folders show
@@ -153,13 +153,15 @@ std::atomic<bool> g_applyingSettings;
 std::atomic<int> g_hookCallCounter;
 std::atomic<bool> g_taskbarViewDllHooked;
 
-// Dock width per monitor, in pixels. While animating, current moves from
-// "from" to "target".
+// Dock length per monitor, in pixels: the width of a top or bottom taskbar, the
+// height of a left or right one. While animating, current moves from "from" to
+// "target". A length measured for the other orientation isn't used.
 struct DockWidth {
     int current;
     int from;
     int target;
     ULONGLONG startTick;
+    bool vertical;
 };
 
 std::mutex g_dockWidthsMutex;
@@ -352,107 +354,210 @@ bool GetMonitorRect(HMONITOR monitor, RECT* rc) {
 
 int GetMonitorIndex(HMONITOR monitor);
 
-int GetDockWidthForMonitor(HMONITOR monitor, const RECT& monitorRect) {
-    int width = 0;
-    if (g_settings.dynamicWidth) {
-        std::lock_guard<std::mutex> guard(g_dockWidthsMutex);
-        auto it = g_dockWidths.find(monitor);
-        if (it != g_dockWidths.end()) {
-            width = it->second.current;
-        }
-    }
-
-    // Until the icons are measured, a dynamic dock is as wide as the screen,
-    // like the original taskbar, so Windows doesn't shrink the buttons for
-    // lack of room. The monitor index keeps the taskbars' widths distinct.
-    // One pixel less than the screen on every monitor: when the mod is loaded
-    // while the taskbar is screen-wide, the size changes, so the taskbar is
-    // laid out again and measured.
-    if (!width && g_settings.dynamicWidth) {
-        width = monitorRect.right - monitorRect.left - 1 - GetMonitorIndex(monitor);
-    }
-
-    if (!width) {
-        UINT dpiX = 96;
-        UINT dpiY = 96;
-        GetDpiForMonitor(monitor, MDT_DEFAULT, &dpiX, &dpiY);
-        width = MulDiv(g_settings.width, dpiX, 96) + GetMonitorIndex(monitor);
-    }
-
-    return std::min(width, (int)(monitorRect.right - monitorRect.left));
-}
-
-// Narrows and centers a horizontal bottom taskbar rect. The rect of an
-// auto-hidden taskbar is mostly below the monitor, so the monitor is taken from
-// the top edge.
-void NarrowBottomTaskbarRect(RECT* rc) {
-    if (rc->right - rc->left <= rc->bottom - rc->top) {
-        return;
-    }
-
-    HMONITOR monitor = MonitorFromPoint({(rc->left + rc->right) / 2, rc->top},
-                                        MONITOR_DEFAULTTONEAREST);
+// The screen edge a taskbar rect is docked to, and its monitor. Horizontal
+// rects are top or bottom, vertical ones left or right. The rect of an
+// auto-hidden taskbar is mostly outside its monitor, so the monitor is taken
+// from the rect's edges: first the one facing the monitor's far side.
+struct TaskbarEdge {
+    UINT edge;  // ABE_LEFT, ABE_TOP, ABE_RIGHT or ABE_BOTTOM.
+    HMONITOR monitor;
     RECT monitorRect;
-    if (!GetMonitorRect(monitor, &monitorRect)) {
-        return;
-    }
+};
 
-    // Bottom taskbar only.
-    if (rc->top < (monitorRect.top + monitorRect.bottom) / 2) {
-        return;
-    }
-
-    int width = GetDockWidthForMonitor(monitor, monitorRect);
-    rc->left =
-        monitorRect.left + (monitorRect.right - monitorRect.left - width) / 2;
-    rc->right = rc->left + width;
-
-    // Lift the dock off the bottom edge. An auto-hidden taskbar (mostly below
-    // the monitor) stays where Windows puts it. The rect may already be lifted,
-    // so it's placed from the monitor edge to keep this idempotent.
-    UINT dpiX = 96;
-    UINT dpiY = 96;
-    GetDpiForMonitor(monitor, MDT_DEFAULT, &dpiX, &dpiY);
-    int margin = MulDiv(g_settings.margin, dpiY, 96);
-    if (margin > 0 && (rc->bottom == monitorRect.bottom ||
-                       rc->bottom == monitorRect.bottom - margin)) {
-        int height = rc->bottom - rc->top;
-        rc->bottom = monitorRect.bottom - margin;
-        rc->top = rc->bottom - height;
-    }
+bool IsVerticalEdge(UINT edge) {
+    return edge == ABE_LEFT || edge == ABE_RIGHT;
 }
 
-// Whether the rect is the dock's (narrowed and centered at the bottom).
-bool IsDockRect(const RECT* rc) {
-    RECT fullWidth = *rc;
-    HMONITOR monitor = MonitorFromPoint({(rc->left + rc->right) / 2, rc->top},
-                                        MONITOR_DEFAULTTONEAREST);
+bool GetTaskbarEdge(const RECT* rc, TaskbarEdge* result) {
+    bool vertical = rc->right - rc->left < rc->bottom - rc->top;
+    POINT nearPoint = vertical
+                          ? POINT{rc->left, (rc->top + rc->bottom) / 2}
+                          : POINT{(rc->left + rc->right) / 2, rc->top};
+    POINT farPoint = vertical
+                         ? POINT{rc->right - 1, (rc->top + rc->bottom) / 2}
+                         : POINT{(rc->left + rc->right) / 2, rc->bottom - 1};
+
+    // Right or bottom: the rect's left or top edge is past the middle of its
+    // monitor.
+    HMONITOR monitor = MonitorFromPoint(nearPoint, MONITOR_DEFAULTTONEAREST);
     RECT monitorRect;
     if (!GetMonitorRect(monitor, &monitorRect)) {
         return false;
     }
 
-    fullWidth.left = monitorRect.left;
-    fullWidth.right = monitorRect.right;
-    NarrowBottomTaskbarRect(&fullWidth);
-    return EqualRect(&fullWidth, rc) &&
-           rc->right - rc->left < monitorRect.right - monitorRect.left;
+    if (vertical ? rc->left >= (monitorRect.left + monitorRect.right) / 2
+                 : rc->top >= (monitorRect.top + monitorRect.bottom) / 2) {
+        *result = {vertical ? (UINT)ABE_RIGHT : (UINT)ABE_BOTTOM, monitor,
+                   monitorRect};
+        return true;
+    }
+
+    // Left or top: the rect's right or bottom edge is before the middle.
+    monitor = MonitorFromPoint(farPoint, MONITOR_DEFAULTTONEAREST);
+    if (!GetMonitorRect(monitor, &monitorRect)) {
+        return false;
+    }
+
+    if (vertical ? rc->right <= (monitorRect.left + monitorRect.right) / 2
+                 : rc->bottom <= (monitorRect.top + monitorRect.bottom) / 2) {
+        *result = {vertical ? (UINT)ABE_LEFT : (UINT)ABE_TOP, monitor,
+                   monitorRect};
+        return true;
+    }
+
+    return false;
+}
+
+int GetDockLengthForMonitor(HMONITOR monitor,
+                            const RECT& monitorRect,
+                            bool vertical) {
+    int monitorLength = vertical ? monitorRect.bottom - monitorRect.top
+                                 : monitorRect.right - monitorRect.left;
+
+    int length = 0;
+    if (g_settings.dynamicWidth) {
+        std::lock_guard<std::mutex> guard(g_dockWidthsMutex);
+        auto it = g_dockWidths.find(monitor);
+        if (it != g_dockWidths.end() && it->second.vertical == vertical) {
+            length = it->second.current;
+        }
+    }
+
+    // Until the icons are measured, a dynamic dock is as long as the screen,
+    // like the original taskbar, so Windows doesn't shrink the buttons for
+    // lack of room. The monitor index keeps the taskbars' lengths distinct.
+    // One pixel less than the screen on every monitor: when the mod is loaded
+    // while the taskbar is screen-wide, the size changes, so the taskbar is
+    // laid out again and measured.
+    if (!length && g_settings.dynamicWidth) {
+        length = monitorLength - 1 - GetMonitorIndex(monitor);
+    }
+
+    if (!length) {
+        UINT dpiX = 96;
+        UINT dpiY = 96;
+        GetDpiForMonitor(monitor, MDT_DEFAULT, &dpiX, &dpiY);
+        length = MulDiv(g_settings.width, vertical ? dpiY : dpiX, 96) +
+                 GetMonitorIndex(monitor);
+    }
+
+    return std::min(length, monitorLength);
+}
+
+// Shortens and centers a taskbar rect along its screen edge, and moves it off
+// the edge by the margin. An auto-hidden taskbar (mostly outside the monitor)
+// stays where Windows puts it. The rect may already be moved, so it's placed
+// from the monitor edge to keep this idempotent.
+void NarrowTaskbarRect(RECT* rc) {
+    TaskbarEdge edge;
+    if (!GetTaskbarEdge(rc, &edge)) {
+        return;
+    }
+
+    const RECT& m = edge.monitorRect;
+    bool vertical = IsVerticalEdge(edge.edge);
+    int length = GetDockLengthForMonitor(edge.monitor, m, vertical);
+    if (vertical) {
+        rc->top = m.top + (m.bottom - m.top - length) / 2;
+        rc->bottom = rc->top + length;
+    } else {
+        rc->left = m.left + (m.right - m.left - length) / 2;
+        rc->right = rc->left + length;
+    }
+
+    UINT dpiX = 96;
+    UINT dpiY = 96;
+    GetDpiForMonitor(edge.monitor, MDT_DEFAULT, &dpiX, &dpiY);
+    int margin = MulDiv(g_settings.margin, vertical ? dpiX : dpiY, 96);
+    if (margin <= 0) {
+        return;
+    }
+
+    int thickness = vertical ? rc->right - rc->left : rc->bottom - rc->top;
+    switch (edge.edge) {
+        case ABE_BOTTOM:
+            if (rc->bottom == m.bottom || rc->bottom == m.bottom - margin) {
+                rc->bottom = m.bottom - margin;
+                rc->top = rc->bottom - thickness;
+            }
+            break;
+        case ABE_TOP:
+            if (rc->top == m.top || rc->top == m.top + margin) {
+                rc->top = m.top + margin;
+                rc->bottom = rc->top + thickness;
+            }
+            break;
+        case ABE_RIGHT:
+            if (rc->right == m.right || rc->right == m.right - margin) {
+                rc->right = m.right - margin;
+                rc->left = rc->right - thickness;
+            }
+            break;
+        case ABE_LEFT:
+            if (rc->left == m.left || rc->left == m.left + margin) {
+                rc->left = m.left + margin;
+                rc->right = rc->left + thickness;
+            }
+            break;
+    }
+}
+
+// Whether the rect is the dock's (shortened and centered along its edge).
+bool IsDockRect(const RECT* rc, TaskbarEdge* edge) {
+    if (!GetTaskbarEdge(rc, edge)) {
+        return false;
+    }
+
+    const RECT& m = edge->monitorRect;
+    bool vertical = IsVerticalEdge(edge->edge);
+    RECT fullLength = *rc;
+    if (vertical) {
+        fullLength.top = m.top;
+        fullLength.bottom = m.bottom;
+    } else {
+        fullLength.left = m.left;
+        fullLength.right = m.right;
+    }
+    NarrowTaskbarRect(&fullLength);
+
+    int length = vertical ? rc->bottom - rc->top : rc->right - rc->left;
+    int monitorLength = vertical ? m.bottom - m.top : m.right - m.left;
+    return EqualRect(&fullLength, rc) && length < monitorLength;
 }
 
 // Explorer computes the work area as "monitor minus taskbar" with
-// SubtractRect, which only subtracts when the taskbar spans the full width.
-// For that computation the dock is widened to the monitor edges, so maximized
-// windows stop above the dock.
+// SubtractRect, which only subtracts when the taskbar spans the full side.
+// For that computation the dock is stretched to the monitor edges, so maximized
+// windows stop before the dock.
 using SubtractRect_t = decltype(&SubtractRect);
 SubtractRect_t SubtractRect_Original;
 BOOL WINAPI SubtractRect_Hook(LPRECT lprcDst,
                               const RECT* lprcSrc1,
                               const RECT* lprcSrc2) {
-    if (IsActive() && lprcSrc1 && lprcSrc2 && IsDockRect(lprcSrc2)) {
+    TaskbarEdge edge;
+    if (IsActive() && lprcSrc1 && lprcSrc2 && IsDockRect(lprcSrc2, &edge)) {
         RECT widened = *lprcSrc2;
-        widened.left = std::min(widened.left, lprcSrc1->left);
-        widened.right = std::max(widened.right, lprcSrc1->right);
-        widened.bottom = std::max(widened.bottom, lprcSrc1->bottom);
+        if (IsVerticalEdge(edge.edge)) {
+            widened.top = std::min(widened.top, lprcSrc1->top);
+            widened.bottom = std::max(widened.bottom, lprcSrc1->bottom);
+        } else {
+            widened.left = std::min(widened.left, lprcSrc1->left);
+            widened.right = std::max(widened.right, lprcSrc1->right);
+        }
+        switch (edge.edge) {
+            case ABE_BOTTOM:
+                widened.bottom = std::max(widened.bottom, lprcSrc1->bottom);
+                break;
+            case ABE_TOP:
+                widened.top = std::min(widened.top, lprcSrc1->top);
+                break;
+            case ABE_RIGHT:
+                widened.right = std::max(widened.right, lprcSrc1->right);
+                break;
+            case ABE_LEFT:
+                widened.left = std::min(widened.left, lprcSrc1->left);
+                break;
+        }
         return SubtractRect_Original(lprcDst, lprcSrc1, &widened);
     }
 
@@ -1155,19 +1260,38 @@ struct TrackedFrame {
     // don't re-measure the taskbar frame, so the dock width is updated here.
     FrameworkElement trayFrame{nullptr};
     winrt::event_token traySizeChangedToken{};
-    // The icons, moved right so Start is as far from the dock's left edge as
-    // from its top and bottom edges.
+    // The icons, moved away from the dock's start (left, or top on a left or
+    // right taskbar) so Start is as far from that edge as from the sides.
     FrameworkElement repeater{nullptr};
     winrt::Windows::Foundation::IInspectable savedRepeaterMargin{nullptr};
+    bool repeaterVertical = false;
 };
 
-// Extra space before Start, in DIPs: the dock is that much wider, and the gap
-// left of the Start logo matches the gap above and below it.
+// Whether the taskbar frame is laid out vertically (left or right taskbar):
+// Windows makes its XAML island taller than wide.
+bool IsVerticalFrame(FrameworkElement taskbarFrame) {
+    auto xamlRoot = taskbarFrame.XamlRoot();
+    if (!xamlRoot) {
+        return false;
+    }
+
+    auto size = xamlRoot.Size();
+    return size.Height > size.Width;
+}
+
+// Extra space before Start, in DIPs: the dock is that much longer, and the gap
+// before the Start logo matches the gap on its sides.
 constexpr double kStartInset = 2;
 
+void RestoreStartButton(TrackedFrame& tracked);
+
 void InsetStartButton(TrackedFrame& tracked, FrameworkElement taskbarFrame) {
+    bool vertical = IsVerticalFrame(taskbarFrame);
     if (tracked.repeater) {
-        return;
+        if (tracked.repeaterVertical == vertical) {
+            return;
+        }
+        RestoreStartButton(tracked);
     }
 
     auto rootGrid = FindChildByName(taskbarFrame, L"RootGrid");
@@ -1180,9 +1304,14 @@ void InsetStartButton(TrackedFrame& tracked, FrameworkElement taskbarFrame) {
     tracked.savedRepeaterMargin =
         repeater.ReadLocalValue(FrameworkElement::MarginProperty());
     Thickness margin = repeater.Margin();
-    margin.Left += kStartInset;
+    if (vertical) {
+        margin.Top += kStartInset;
+    } else {
+        margin.Left += kStartInset;
+    }
     repeater.Margin(margin);
     tracked.repeater = repeater;
+    tracked.repeaterVertical = vertical;
 }
 
 void RestoreStartButton(TrackedFrame& tracked) {
@@ -1412,7 +1541,8 @@ void WatchTraySize(TrackedFrame& tracked, FrameworkElement taskbarFrame) {
     auto weakFrame = tracked.frame;
     tracked.traySizeChangedToken = trayFrame.SizeChanged(
         [weakFrame](const auto&, const SizeChangedEventArgs& args) {
-            if (args.PreviousSize().Width != args.NewSize().Width) {
+            if (args.PreviousSize().Width != args.NewSize().Width ||
+                args.PreviousSize().Height != args.NewSize().Height) {
                 if (auto frame = weakFrame.get()) {
                     frame.InvalidateMeasure();
                 }
@@ -1453,7 +1583,9 @@ void TrackTaskbarFrame(FrameworkElement taskbarFrame) {
              : ShowSettingsButton() &&
                    tracked->addFailures < kMaxSettingsButtonAddFailures) ||
         IsActive() != (bool)tracked->trayFrame ||
-        IsActive() != (bool)tracked->repeater;
+        IsActive() != (bool)tracked->repeater ||
+        (tracked->repeater &&
+         tracked->repeaterVertical != IsVerticalFrame(taskbarFrame));
 
     if (needsUpdate && !g_frameCustomizationPending.exchange(true)) {
         if (HWND hTaskbarWnd = FindCurrentProcessTaskbarWnd()) {
@@ -1530,14 +1662,15 @@ int GetMonitorIndex(HMONITOR monitor) {
     return param.result;
 }
 
-// The taskbar a XAML island belongs to, matched by width: the island is as
-// wide as the taskbar window.
-HWND FindTaskbarWindowByIslandWidth(double islandWidth) {
+// The taskbar a XAML island belongs to, matched by length: the island is as
+// long as the taskbar window (as wide, or as tall for a vertical taskbar).
+HWND FindTaskbarWindowByIslandLength(double islandLength, bool vertical) {
     struct Param {
-        double islandWidth;
+        double islandLength;
+        bool vertical;
         HWND found;
         int matches;
-    } param{islandWidth, nullptr, 0};
+    } param{islandLength, vertical, nullptr, 0};
 
     EnumWindows(
         [](HWND hWnd, LPARAM lParam) -> BOOL {
@@ -1550,8 +1683,9 @@ HWND FindTaskbarWindowByIslandWidth(double islandWidth) {
 
             RECT rc;
             GetClientRect(hWnd, &rc);
-            double width = (rc.right - rc.left) * 96.0 / GetDpiForWindow(hWnd);
-            if (std::abs(width - param.islandWidth) < 0.75) {
+            int pixels = param.vertical ? rc.bottom - rc.top : rc.right - rc.left;
+            double length = pixels * 96.0 / GetDpiForWindow(hWnd);
+            if (std::abs(length - param.islandLength) < 0.75) {
                 param.found = hWnd;
                 param.matches++;
             }
@@ -1577,25 +1711,31 @@ void UpdateDockWidthFromFrame(FrameworkElement taskbarFrame) {
         return;
     }
 
-    double iconsWidth = repeater.DesiredSize().Width;
+    bool vertical = IsVerticalFrame(taskbarFrame);
+    auto lengthOf = [vertical](winrt::Windows::Foundation::Size size) {
+        return (double)(vertical ? size.Height : size.Width);
+    };
+
+    double iconsLength = lengthOf(repeater.DesiredSize());
 
     // Includes the settings button, which sits in the clock area.
-    double trayWidth = 0;
+    double trayLength = 0;
     if (auto trayFrame = GetTrayFrame(taskbarFrame)) {
-        trayWidth = trayFrame.DesiredSize().Width;
+        trayLength = lengthOf(trayFrame.DesiredSize());
     }
 
-    double islandWidth = xamlRoot.Size().Width;
-    double neededWidth = iconsWidth + trayWidth + g_settings.padding;
+    double islandLength = lengthOf(xamlRoot.Size());
+    double neededLength = iconsLength + trayLength + g_settings.padding;
 
-    HWND hWnd = FindTaskbarWindowByIslandWidth(islandWidth);
+    HWND hWnd = FindTaskbarWindowByIslandLength(islandLength, vertical);
 
-    DebugLog(L"Measure: island=%.1f icons=%.1f tray=%.1f -> %.1f (hwnd %p)",
-             islandWidth, iconsWidth, trayWidth, neededWidth, hWnd);
+    DebugLog(L"Measure%s: island=%.1f icons=%.1f tray=%.1f -> %.1f (hwnd %p)",
+             vertical ? L" (vertical)" : L"", islandLength, iconsLength,
+             trayLength, neededLength, hWnd);
 
     if (hWnd) {
         PostMessage(hWnd, g_dockWidthMsg,
-                    (WPARAM)std::lround(neededWidth * 100), 0);
+                    (WPARAM)std::lround(neededLength * 100), vertical);
     }
 }
 
@@ -1603,7 +1743,7 @@ void UpdateDockWidthFromFrame(FrameworkElement taskbarFrame) {
 void MoveToDockRect(HWND hWnd) {
     RECT rc;
     GetWindowRect(hWnd, &rc);
-    NarrowBottomTaskbarRect(&rc);
+    NarrowTaskbarRect(&rc);
 
     SetWindowPos(hWnd, nullptr, rc.left, rc.top, rc.right - rc.left,
                  rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -1622,8 +1762,9 @@ void CALLBACK WidthAnimationTimerProc(HWND hWnd, UINT, UINT_PTR, DWORD) {
     StepWidthAnimation(hWnd);
 }
 
-// Applies the measured width (in DIPs * 100) to the taskbar window.
-void ApplyDockWidth(HWND hWnd, WPARAM widthDip100) {
+// Applies the measured length (in DIPs * 100) to the taskbar window: its width,
+// or its height when vertical.
+void ApplyDockWidth(HWND hWnd, WPARAM widthDip100, bool vertical) {
     if (!IsActive() || !g_settings.dynamicWidth) {
         return;
     }
@@ -1638,6 +1779,14 @@ void ApplyDockWidth(HWND hWnd, WPARAM widthDip100) {
     {
         std::lock_guard<std::mutex> guard(g_dockWidthsMutex);
         auto& dockWidth = g_dockWidths[monitor];
+
+        // The taskbar moved to an edge of the other orientation: the length
+        // measured before doesn't apply.
+        if (dockWidth.vertical != vertical) {
+            dockWidth = {};
+            dockWidth.vertical = vertical;
+        }
+
         if (dockWidth.target == width) {
             return;
         }
@@ -1717,18 +1866,25 @@ int WINAPI TaskbarFrame_MeasureOverride_Hook(
 
     bool measureNatural = IsActive() && g_settings.dynamicWidth;
 
-    // Measure with plenty of room, so the icons report their natural width
+    // Measure with plenty of room along the taskbar (its width, or its height
+    // on a left or right taskbar), so the icons report their natural length
     // instead of the one squeezed into the current space.
+    bool vertical = size.Height > size.Width;
     auto measureSize = size;
     if (measureNatural) {
-        measureSize.Width = std::max(size.Width, 10000.0f);
+        if (vertical) {
+            measureSize.Height = std::max(size.Height, 10000.0f);
+        } else {
+            measureSize.Width = std::max(size.Width, 10000.0f);
+        }
     }
 
     int ret =
         TaskbarFrame_MeasureOverride_Original(pThis, measureSize, resultSize);
 
-    if (measureNatural && resultSize->Width > size.Width) {
-        resultSize->Width = size.Width;
+    if (measureNatural) {
+        resultSize->Width = std::min(resultSize->Width, size.Width);
+        resultSize->Height = std::min(resultSize->Height, size.Height);
     }
 
     if (IsActive()) {
@@ -1855,8 +2011,8 @@ void WINAPI TrayUI_MakeStuckRect_Hook(void* pThis,
                                       DWORD taskbarPos) {
     TrayUI_MakeStuckRect_Original(pThis, rect, param2, param3, taskbarPos);
 
-    if (IsActive() && taskbarPos == ABE_BOTTOM) {
-        NarrowBottomTaskbarRect(rect);
+    if (IsActive()) {
+        NarrowTaskbarRect(rect);
     }
 }
 
@@ -1868,7 +2024,7 @@ DWORD WINAPI TrayUI_GetDockedRect_Hook(void* pThis, RECT* rect, BOOL param2) {
     DWORD ret = TrayUI_GetDockedRect_Original(pThis, rect, param2);
 
     if (IsActive()) {
-        NarrowBottomTaskbarRect(rect);
+        NarrowTaskbarRect(rect);
     }
 
     return ret;
@@ -1881,7 +2037,7 @@ void WINAPI CSecondaryTray__ComputeHiddenRect_Hook(void* pThis, RECT* rect) {
     CSecondaryTray__ComputeHiddenRect_Original(pThis, rect);
 
     if (IsActive()) {
-        NarrowBottomTaskbarRect(rect);
+        NarrowTaskbarRect(rect);
     }
 }
 
@@ -1914,7 +2070,7 @@ void TaskbarWndProcPostProcess(HWND hWnd, UINT Msg, LPARAM lParam) {
     rc.bottom = rc.top + cy;
 
     RECT narrowed = rc;
-    NarrowBottomTaskbarRect(&narrowed);
+    NarrowTaskbarRect(&narrowed);
     if (EqualRect(&narrowed, &rc)) {
         return;
     }
@@ -1927,9 +2083,9 @@ void TaskbarWndProcPostProcess(HWND hWnd, UINT Msg, LPARAM lParam) {
 }
 
 // Messages of our own sent to the taskbar windows. Returns true if handled.
-bool HandleDockMessage(HWND hWnd, UINT Msg, WPARAM wParam) {
+bool HandleDockMessage(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
     if (Msg == g_dockWidthMsg) {
-        ApplyDockWidth(hWnd, wParam);
+        ApplyDockWidth(hWnd, wParam, lParam != 0);
         return true;
     }
 
@@ -1971,7 +2127,7 @@ LRESULT WINAPI TrayUI_WndProc_Hook(void* pThis,
                                    WPARAM wParam,
                                    LPARAM lParam,
                                    bool* flag) {
-    if (HandleDockMessage(hWnd, Msg, wParam)) {
+    if (HandleDockMessage(hWnd, Msg, wParam, lParam)) {
         return 0;
     }
 
@@ -1996,7 +2152,7 @@ LRESULT WINAPI CSecondaryTray_v_WndProc_Hook(void* pThis,
                                              UINT Msg,
                                              WPARAM wParam,
                                              LPARAM lParam) {
-    if (HandleDockMessage(hWnd, Msg, wParam)) {
+    if (HandleDockMessage(hWnd, Msg, wParam, lParam)) {
         return 0;
     }
 
@@ -2912,11 +3068,10 @@ constexpr SettingsText kSettingsTexts[] = {
      L"every window",
      L"Toglie la linea sottile che Windows 11 disegna attorno alla barra delle "
      L"applicazioni, come attorno a ogni finestra"},
-    {L"Margin", L"Bottom margin", L"Margine dal bordo"},
+    {L"Margin", L"Edge margin", L"Margine dal bordo"},
     {L"MarginDesc",
-     L"Gap between the taskbar and the bottom edge of the screen",
-     L"Spazio tra la barra delle applicazioni e il bordo inferiore dello "
-     L"schermo"},
+     L"Gap between the taskbar and the edge of the screen",
+     L"Spazio tra la barra delle applicazioni e il bordo dello schermo"},
     {L"SettingsButton", L"Settings button", L"Pulsante impostazioni"},
     {L"SettingsButtonDesc",
      L"A button on the taskbar, before the clock, that opens this window",
