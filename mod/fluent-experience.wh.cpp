@@ -2,7 +2,7 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.20.1
+// @version         0.20.2
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
@@ -2603,6 +2603,8 @@ constexpr WCHAR kFolderIconsBackupSubKey[] =
 constexpr int kFolderIconSizes[] = {16, 24, 32, 48, 64, 96, 128, 256};
 constexpr int kFolderIconMaxItems = 9;
 constexpr DWORD kFolderIconsDebounce = 1000;
+// A replaced .ico is kept this long: Explorer may still point at it.
+constexpr DWORD kFolderIconsRetireDelay = 10 * 60 * 1000;
 
 HANDLE g_folderIconsThread;
 HANDLE g_folderIconsStopEvent;
@@ -2925,9 +2927,16 @@ std::wstring ReadFolderIcon(const std::wstring& folder) {
     return icon;
 }
 
+// SHCNE_UPDATEITEM alone doesn't make the desktop re-read desktop.ini, so the
+// folder's parent is told to refresh its contents too (SHCNE_UPDATEDIR). The
+// heavier SHCNE_ASSOCCHANGED (rebuilds every icon) is not needed: each new
+// icon has a new file name, so there is nothing stale to flush.
 void NotifyFolderChanged(const std::wstring& folder) {
     SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
                    folder.c_str(), nullptr);
+    std::wstring parent = folder.substr(0, folder.rfind(L'\\'));
+    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
+                   parent.c_str(), nullptr);
 }
 
 bool SetFolderIcon(const std::wstring& folder, const std::wstring& icon) {
@@ -3022,7 +3031,11 @@ void RestoreFolderIcon(const std::wstring& folder, const FolderIconBackup& backu
 // name as File Explorer sorts them.
 std::vector<std::wstring> ListFolderItems(const std::wstring& folder,
                                       std::wstring* signature) {
-    std::vector<std::pair<std::wstring, FILETIME>> found;
+    struct Found {
+        std::wstring name;
+        std::wstring state;
+    };
+    std::vector<Found> found;
     WIN32_FIND_DATA data;
     HANDLE find = FindFirstFile((folder + L"\\*").c_str(), &data);
     if (find != INVALID_HANDLE_VALUE) {
@@ -3033,21 +3046,27 @@ std::vector<std::wstring> ListFolderItems(const std::wstring& folder,
                  (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))) {
                 continue;
             }
-            found.push_back({data.cFileName, data.ftLastWriteTime});
+            // What decides the item's icon: a file's own data, a folder's
+            // custom icon. Changes inside a subfolder don't count.
+            std::wstring state =
+                (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                    ? ReadFolderIcon(folder + L"\\" + data.cFileName)
+                    : std::to_wstring(data.ftLastWriteTime.dwLowDateTime) + L"|" +
+                          std::to_wstring(data.nFileSizeLow);
+            found.push_back({data.cFileName, state});
         } while (FindNextFile(find, &data));
         FindClose(find);
     }
 
     std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) {
-        return StrCmpLogicalW(a.first.c_str(), b.first.c_str()) < 0;
+        return StrCmpLogicalW(a.name.c_str(), b.name.c_str()) < 0;
     });
 
     std::vector<std::wstring> items;
     signature->clear();
     for (size_t i = 0; i < found.size() && i < kFolderIconMaxItems; i++) {
-        items.push_back(folder + L"\\" + found[i].first);
-        *signature += found[i].first + L"|" +
-                      std::to_wstring(found[i].second.dwLowDateTime) + L"|";
+        items.push_back(folder + L"\\" + found[i].name);
+        *signature += found[i].name + L"|" + found[i].state + L"|";
     }
     return items;
 }
@@ -3092,12 +3111,20 @@ std::vector<std::wstring> DesktopFolders() {
     return folders;
 }
 
-void DeleteUnusedFolderIconFiles(const std::vector<std::wstring>& used) {
+// Deletes the .ico files not in use. Unused files modified more recently than
+// the retire delay are kept (a replaced icon is touched when it is replaced);
+// returns true when some were kept, so the caller comes back later.
+bool DeleteUnusedFolderIconFiles(const std::vector<std::wstring>& used,
+                                 DWORD retireDelay) {
     std::wstring dir = FolderIconsDir();
+    bool kept = false;
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    ULONGLONG nowTime = ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime;
     WIN32_FIND_DATA data;
     HANDLE find = FindFirstFile((dir + L"\\*.ico").c_str(), &data);
     if (find == INVALID_HANDLE_VALUE) {
-        return;
+        return false;
     }
     do {
         std::wstring path = dir + L"\\" + data.cFileName;
@@ -3105,18 +3132,41 @@ void DeleteUnusedFolderIconFiles(const std::vector<std::wstring>& used) {
             return CompareStringOrdinal(u.c_str(), -1, path.c_str(), -1, TRUE) ==
                    CSTR_EQUAL;
         });
-        if (!inUse) {
+        ULONGLONG written = ((ULONGLONG)data.ftLastWriteTime.dwHighDateTime << 32) |
+                            data.ftLastWriteTime.dwLowDateTime;
+        if (inUse) {
+            continue;
+        }
+        if (nowTime - written < (ULONGLONG)retireDelay * 10000) {
+            kept = true;
+        } else {
             DeleteFile(path.c_str());
         }
     } while (FindNextFile(find, &data));
     FindClose(find);
+    return kept;
 }
 
-void ApplyFolderIcons() {
+// Starts the retire clock of an icon that has just been replaced.
+void RetireFolderIconFile(const std::wstring& icon) {
+    std::wstring file = icon.substr(0, icon.rfind(L','));
+    HANDLE handle = CreateFile(file.c_str(), FILE_WRITE_ATTRIBUTES,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, 0, nullptr);
+    if (handle != INVALID_HANDLE_VALUE) {
+        FILETIME now;
+        GetSystemTimeAsFileTime(&now);
+        SetFileTime(handle, nullptr, nullptr, &now);
+        CloseHandle(handle);
+    }
+}
+
+// Returns true when replaced .ico files are still kept (call again later).
+bool ApplyFolderIcons() {
     std::wstring dir = FolderIconsDir();
     if (dir.empty() || SHCreateDirectoryEx(nullptr, dir.c_str(), nullptr) ==
                            ERROR_PATH_NOT_FOUND) {
-        return;
+        return false;
     }
 
     auto backups = ReadBackups();
@@ -3174,6 +3224,9 @@ void ApplyFolderIcons() {
         // Folders where it can't be written (the public desktop needs
         // administrator rights) keep their icon.
         if (SetFolderIcon(folder, icon)) {
+            if (StartsWithNoCase(current, dir)) {
+                RetireFolderIconFile(current);
+            }
             handled.push_back(folder);
             usedIcons.push_back(iconPath);
             DebugLog(L"Folder icon set: %s", folder.c_str());
@@ -3196,7 +3249,7 @@ void ApplyFolderIcons() {
         }
     }
 
-    DeleteUnusedFolderIconFiles(usedIcons);
+    return DeleteUnusedFolderIconFiles(usedIcons, kFolderIconsRetireDelay);
 }
 
 void RemoveFolderIcons() {
@@ -3214,18 +3267,19 @@ void RemoveFolderIcons() {
 
     std::wstring dir = FolderIconsDir();
     if (!dir.empty()) {
-        DeleteUnusedFolderIconFiles({});
+        DeleteUnusedFolderIconFiles({}, 0);
         RemoveDirectory(dir.c_str());
         RemoveDirectory((dir.substr(0, dir.rfind(L'\\'))).c_str());
     }
 }
 
-void SyncFolderIcons() {
+// Returns true when replaced .ico files are still kept (call again later).
+bool SyncFolderIcons() {
     if (!g_unloading && IsActive() && g_settings.folderIcons) {
-        ApplyFolderIcons();
-    } else {
-        RemoveFolderIcons();
+        return ApplyFolderIcons();
     }
+    RemoveFolderIcons();
+    return false;
 }
 
 // Watches the desktop folders (both desktops, with their subfolders) and the
@@ -3274,9 +3328,8 @@ DWORD WINAPI FolderIconsThreadProc(LPVOID) {
         events.push_back(watch->event);
     }
 
-    SyncFolderIcons();
-
-    ULONGLONG due = 0;
+    ULONGLONG due =
+        SyncFolderIcons() ? GetTickCount64() + kFolderIconsRetireDelay : 0;
     while (true) {
         DWORD timeout = INFINITE;
         if (due) {
@@ -3289,8 +3342,7 @@ DWORD WINAPI FolderIconsThreadProc(LPVOID) {
             break;
         }
         if (wait == WAIT_TIMEOUT) {
-            due = 0;
-            SyncFolderIcons();
+            due = SyncFolderIcons() ? GetTickCount64() + kFolderIconsRetireDelay : 0;
             continue;
         }
         if (wait >= WAIT_OBJECT_0 + 2) {
