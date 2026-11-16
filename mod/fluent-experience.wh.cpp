@@ -2,7 +2,7 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.20.2
+// @version         0.20.3
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
@@ -2927,16 +2927,42 @@ std::wstring ReadFolderIcon(const std::wstring& folder) {
     return icon;
 }
 
-// SHCNE_UPDATEITEM alone doesn't make the desktop re-read desktop.ini, so the
-// folder's parent is told to refresh its contents too (SHCNE_UPDATEDIR). The
-// heavier SHCNE_ASSOCCHANGED (rebuilds every icon) is not needed: each new
-// icon has a new file name, so there is nothing stale to flush.
-void NotifyFolderChanged(const std::wstring& folder) {
+// What the folder shows now: its system image list index and the icon file and
+// index behind it (the stock folder icon when it has no custom one).
+struct ShownIcon {
+    int image = -1;
+    WCHAR file[MAX_PATH] = L"";
+    int index = 0;
+};
+
+ShownIcon GetShownIcon(const std::wstring& folder) {
+    ShownIcon shown;
+    SHFILEINFO info{};
+    if (SHGetFileInfo(folder.c_str(), 0, &info, sizeof(info), SHGFI_SYSICONINDEX)) {
+        shown.image = info.iIcon;
+    }
+    info = {};
+    if (SHGetFileInfo(folder.c_str(), 0, &info, sizeof(info), SHGFI_ICONLOCATION)) {
+        wcscpy_s(shown.file, info.szDisplayName);
+        shown.index = info.iIcon;
+    }
+    return shown;
+}
+
+// SHCNE_UPDATEITEM alone doesn't make the desktop drop the image it cached for
+// the folder (seen on the desktop: the stock folder stayed until Explorer was
+// restarted). SHUpdateImage tells the Shell that the OLD image changed, so
+// views re-ask for their icons. It needs the old icon's location, which the
+// caller reads before the change; the old file must still exist. With no
+// custom icon the old image is the stock folder one: it is re-read as it is
+// (cheap), but every view re-asks all its icons once. SHCNE_ASSOCCHANGED
+// (rebuilds every icon) is not used.
+void NotifyFolderChanged(const std::wstring& folder, const ShownIcon& old) {
     SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
                    folder.c_str(), nullptr);
-    std::wstring parent = folder.substr(0, folder.rfind(L'\\'));
-    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSHNOWAIT,
-                   parent.c_str(), nullptr);
+    if (old.image >= 0 && old.file[0]) {
+        SHUpdateImage(old.file, old.index, 0, old.image);
+    }
 }
 
 bool SetFolderIcon(const std::wstring& folder, const std::wstring& icon) {
@@ -2944,6 +2970,7 @@ bool SetFolderIcon(const std::wstring& folder, const std::wstring& icon) {
     std::wstring file = comma == std::wstring::npos ? icon : icon.substr(0, comma);
     int index = comma == std::wstring::npos ? 0 : _wtoi(icon.c_str() + comma + 1);
 
+    ShownIcon old = GetShownIcon(folder);
     SHFOLDERCUSTOMSETTINGS settings{.dwSize = sizeof(settings),
                                     .dwMask = FCSM_ICONFILE,
                                     .pszIconFile = file.data(),
@@ -2951,7 +2978,7 @@ bool SetFolderIcon(const std::wstring& folder, const std::wstring& icon) {
                                     .iIconIndex = index};
     bool ok = SUCCEEDED(
         SHGetSetFolderCustomSettings(&settings, folder.c_str(), FCS_FORCEWRITE));
-    NotifyFolderChanged(folder);
+    NotifyFolderChanged(folder, old);
     return ok;
 }
 
@@ -3010,6 +3037,7 @@ void RestoreFolderIcon(const std::wstring& folder, const FolderIconBackup& backu
         return;
     }
 
+    ShownIcon old = GetShownIcon(folder);
     if (!backup.icon.empty()) {
         SetFolderIcon(folder, backup.icon);
     } else {
@@ -3024,7 +3052,7 @@ void RestoreFolderIcon(const std::wstring& folder, const FolderIconBackup& backu
     }
 
     SetFileAttributes(folder.c_str(), backup.attributes);
-    NotifyFolderChanged(folder);
+    NotifyFolderChanged(folder, old);
 }
 
 // The items shown in a folder's icon: visible files and folders, sorted by
