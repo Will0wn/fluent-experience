@@ -18,9 +18,12 @@ of being stuck with a copy of an older design.
 
 The taskbar is actually narrowed and centered, not just clipped, so clicks,
 menus and corners follow it. Each taskbar grows and shrinks to fit its icons,
-on every monitor, and floats a few pixels off the edge of the screen it's on,
-bottom, top, left or right as set in Windows, while maximized windows stop
-before it.
+on every monitor, on the edge of the screen it's on, bottom, top, left or
+right as set in Windows, while maximized windows stop before it. The "Edge
+margin" setting, off by default, makes it float a few pixels off the edge;
+Start and Search then show a shadow with a hard edge, drawn by Windows for a
+taskbar on the edge, and the settings window says so. Search's own copy of the
+search box is moved to match the taskbar, so it doesn't jump when clicked.
 
 It can use the Windows 11 materials, Acrylic, Mica or Mica Alt, with the
 rounded corners and shadow Windows gives windows, following light/dark mode

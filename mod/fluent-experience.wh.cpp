@@ -2,7 +2,7 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.20.4
+// @version         0.21
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
@@ -131,6 +131,7 @@ struct Settings {
     int width;
     int padding;
     int animationDuration;
+    bool edgeMargin;
     int margin;
     bool settingsButton;
     bool hiddenIconMenu;
@@ -265,6 +266,10 @@ Settings ReadSettings() {
     settings.padding = std::max(ReadIntSetting(key, L"padding", 16), 0);
     settings.animationDuration =
         std::clamp(ReadIntSetting(key, L"animationDuration", 200), 1, 2000);
+    // Off by default (owner, 2026-11-19): with a margin, the shadow Start and
+    // Search draw for a taskbar on the edge hangs over the desktop (RECAP, Open
+    // items 9). Turned on, the taskbar floats by `margin` and a warning says so.
+    settings.edgeMargin = ReadIntSetting(key, L"edgeMargin", 0);
     settings.margin = std::clamp(ReadIntSetting(key, L"margin", 8), 0, 200);
     settings.settingsButton = ReadIntSetting(key, L"settingsButton", 1);
     settings.hiddenIconMenu = ReadIntSetting(key, L"hiddenIconMenu", 1);
@@ -468,7 +473,9 @@ void NarrowTaskbarRect(RECT* rc) {
     UINT dpiX = 96;
     UINT dpiY = 96;
     GetDpiForMonitor(edge.monitor, MDT_DEFAULT, &dpiX, &dpiY);
-    int margin = MulDiv(g_settings.margin, vertical ? dpiX : dpiY, 96);
+    int margin = g_settings.edgeMargin
+                     ? MulDiv(g_settings.margin, vertical ? dpiX : dpiY, 96)
+                     : 0;
     if (margin <= 0) {
         return;
     }
@@ -1507,6 +1514,13 @@ bool IsVerticalFrame(FrameworkElement taskbarFrame) {
 // before the Start logo matches the gap on its sides.
 constexpr double kStartInset = 2;
 
+// The inset in whole physical pixels at a scale (1.75 at 175%). XAML would
+// draw 2 DIPs at 175% as 3.5 px, half a pixel the Search window (moved in
+// whole pixels) can't match; both use this rounded value instead.
+int StartInsetPixels(double scale) {
+    return (int)std::lround(kStartInset * scale);
+}
+
 void RestoreStartButton(TrackedFrame& tracked);
 
 void InsetStartButton(TrackedFrame& tracked, FrameworkElement taskbarFrame) {
@@ -1527,11 +1541,20 @@ void InsetStartButton(TrackedFrame& tracked, FrameworkElement taskbarFrame) {
 
     tracked.savedRepeaterMargin =
         repeater.ReadLocalValue(FrameworkElement::MarginProperty());
+    // The scale is known once the frame is in its island: until then, wait for
+    // a later pass instead of insetting by a guess.
+    auto xamlRoot = taskbarFrame.XamlRoot();
+    double scale = xamlRoot ? xamlRoot.RasterizationScale() : 0;
+    DebugLog(L"Start inset: scale %.3f", scale);
+    if (scale <= 0) {
+        return;
+    }
     Thickness margin = repeater.Margin();
+    double inset = StartInsetPixels(scale) / scale;
     if (vertical) {
-        margin.Top += kStartInset;
+        margin.Top += inset;
     } else {
-        margin.Left += kStartInset;
+        margin.Left += inset;
     }
     repeater.Margin(margin);
     tracked.repeater = repeater;
@@ -3446,6 +3469,13 @@ constexpr SettingsText kSettingsTexts[] = {
     {L"MarginDesc",
      L"Gap between the taskbar and the edge of the screen",
      L"Spazio tra la barra delle applicazioni e il bordo dello schermo"},
+    {L"MarginWarning",
+     L"Start and Search draw a shadow meant for a taskbar on the edge of the "
+     L"screen: with a margin it hangs over the desktop and ends with a hard "
+     L"line. It comes from Windows and the mod can't change it.",
+     L"Start e Cerca disegnano un'ombra pensata per una barra attaccata al "
+     L"bordo dello schermo: con il margine resta sospesa sul desktop e finisce "
+     L"con un taglio netto. Viene da Windows e il mod non la può cambiare."},
     {L"SettingsButton", L"Settings button", L"Pulsante impostazioni"},
     {L"SettingsButtonDesc",
      L"A button on the taskbar, before the clock, that opens this window",
@@ -3560,7 +3590,7 @@ constexpr SettingsText kSettingsTexts[] = {
 constexpr PCWSTR kResettableSettings[] = {
     L"enabled", L"material",          L"border", L"roundedCorners",
     L"dynamicWidth", L"width",        L"padding", L"animationDuration",
-    L"margin",  L"settingsButton",    L"hiddenIconMenu", L"checkUpdates",
+    L"edgeMargin", L"margin",  L"settingsButton",    L"hiddenIconMenu", L"checkUpdates",
     L"folderIcons",
     L"debugLog",
 };
@@ -3729,7 +3759,18 @@ std::wstring SettingsPageXaml() {
                      LR"(<ComboBox x:Name="MaterialCombo" MinWidth="240"/>)");
     xaml += CardXaml(L"RoundedCorners", L"F16B", ToggleXaml(L"RoundedCorners"));
     xaml += CardXaml(L"Border", L"E81E", ToggleXaml(L"Border"));
-    xaml += CardXaml(L"Margin", L"E74B", SliderXaml(L"Margin", 0, 40, 1));
+    xaml += CardXaml(L"Margin", L"E74B",
+                     SliderXaml(L"Margin", 0, 40, 1) + ToggleXaml(L"EdgeMargin"));
+    // Shown while the edge margin is on (owner, 2026-11-19).
+    xaml += LR"(<Grid x:Name="MarginWarningCard" Style="{StaticResource CardStyle}">)"
+            LR"(<Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/>)"
+            LR"(<ColumnDefinition Width="*"/></Grid.ColumnDefinitions>)"
+            // Yellow warning icon and full-strength text: the grey description
+            // style was too faint to notice (owner, 2026-11-19).
+            LR"(<FontIcon Glyph="&#xE7BA;" Style="{StaticResource CardIconStyle}" Foreground="#FFFFB900"/>)"
+            LR"(<TextBlock x:Name="MarginWarning" Grid.Column="1" VerticalAlignment="Center")"
+            LR"( TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorPrimaryBrush}"/>)"
+            LR"(</Grid>)";
     xaml += CardXaml(L"SettingsButton", L"E9E9", ToggleXaml(L"SettingsButton"));
     xaml += CardXaml(L"HiddenIconMenu", L"E70E", ToggleXaml(L"HiddenIconMenu"));
 
@@ -3866,7 +3907,12 @@ void UpdateSettingsUiStates() {
     SetCardEnabled(L"Border", L"BorderToggle",
                    enabled && (!defaultMaterial ||
                                FindToggle(L"RoundedCorners").IsOn()));
-    SetCardEnabled(L"Margin", L"MarginSlider", enabled);
+    bool edgeMargin = FindToggle(L"EdgeMargin").IsOn();
+    SetCardEnabled(L"Margin", L"EdgeMarginToggle", enabled);
+    FindSlider(L"Margin").IsEnabled(enabled && edgeMargin);
+    FindSettingsElement<Controls::Grid>(L"MarginWarningCard")
+        .Visibility(enabled && edgeMargin ? Visibility::Visible
+                                          : Visibility::Collapsed);
     SetCardEnabled(L"SettingsButton", L"SettingsButtonToggle", enabled);
     SetCardEnabled(L"HiddenIconMenu", L"HiddenIconMenuToggle",
                    enabled && !defaultMaterial);
@@ -3987,6 +4033,7 @@ void LoadSettingsUi() {
                  Text(L"RoundedCornersDesc"));
     SetCardTexts(L"Border", Text(L"Border"), Text(L"BorderDesc"));
     SetCardTexts(L"Margin", Text(L"Margin"), Text(L"MarginDesc"));
+    SetSettingsText(L"MarginWarning", Text(L"MarginWarning"));
     SetCardTexts(L"SettingsButton", Text(L"SettingsButton"),
                  Text(L"SettingsButtonDesc"));
     SetCardTexts(L"HiddenIconMenu", Text(L"HiddenIconMenu"),
@@ -4023,7 +4070,7 @@ void LoadSettingsUi() {
 
     for (PCWSTR name : {L"Enabled", L"RoundedCorners", L"Border",
                         L"SettingsButton", L"HiddenIconMenu", L"AppsWhereOpen",
-                        L"DynamicWidth", L"FolderIcons",
+                        L"DynamicWidth", L"FolderIcons", L"EdgeMargin",
                         L"CheckUpdates", L"DebugLog"}) {
         auto toggle = FindToggle(name);
         toggle.OnContent(winrt::box_value(winrt::hstring(Text(L"On"))));
@@ -4046,6 +4093,7 @@ void LoadSettingsUi() {
     FindToggle(L"RoundedCorners").IsOn(settings.roundedCorners);
     FindToggle(L"Border").IsOn(!settings.border);
     FindSlider(L"Margin").Value(settings.margin);
+    FindToggle(L"EdgeMargin").IsOn(settings.edgeMargin);
     FindToggle(L"SettingsButton").IsOn(settings.settingsButton);
     FindToggle(L"HiddenIconMenu").IsOn(settings.hiddenIconMenu);
     FindToggle(L"AppsWhereOpen").IsOn(IsTaskbarAppsWhereWindowOpen());
@@ -4100,6 +4148,7 @@ void ConnectSettingsUi() {
     ConnectToggle(L"FolderIcons", L"folderIcons");
     ConnectToggle(L"DebugLog", L"debugLog");
     ConnectSlider(L"Margin", L"margin");
+    ConnectToggle(L"EdgeMargin", L"edgeMargin");
     ConnectSlider(L"Width", L"width");
     ConnectSlider(L"Padding", L"padding");
     ConnectSlider(L"Duration", L"animationDuration");
@@ -4906,6 +4955,11 @@ try {
     }
     Set-ItemProperty $key -Name LibraryFileName -Value $name -Type String
     Set-ItemProperty $key -Name Version -Value $Version -Type String
+    # The processes the new version loads in (its @include lines, "|"-joined like the Windhawk editor)
+    if (Test-Path $Source) {
+        $includes = ([regex]::Matches((Get-Content $Source -Raw), '//\s*@include\s+(\S+)') | ForEach-Object { $_.Groups[1].Value }) -join '|'
+        if ($includes) { Set-ItemProperty $key -Name Include -Value $includes -Type String }
+    }
     $changeTime = [int]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -band 0x7fffffff)
     Set-ItemProperty $key -Name SettingsChangeTime -Value $changeTime -Type DWord
     for ($i = 0; $i -lt 15; $i++) {
@@ -5080,6 +5134,189 @@ void StopUpdateThread() {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Search window (owner, 2026-11-19). Search (SearchHost.exe) opens as one
+// window down to the screen edge and draws its own copy of Start and the search
+// box at the bottom, placed for Windows' taskbar: on the screen edge, with no
+// gap before Start. Measured on a 4K monitor at 175%: its box sat 14 px lower
+// (the margin) and 4 px further left (the Start inset) than the taskbar's. The
+// window is moved up by the taskbar's distance from the edge and right by the
+// inset; nothing in it is replaced.
+// Two moments place it for Windows' taskbar: Explorer uncloaking it (first
+// open: moved before it shows, hook on DwmSetWindowAttribute), and Start and
+// Search sharing that window: going from Start to Search it's placed again
+// while visible, by neither SearchHost nor Explorer's SetWindowPos (checked
+// with a debugger). That one is caught by a location-change event and moved
+// right after.
+
+using DwmSetWindowAttribute_t = decltype(&DwmSetWindowAttribute);
+DwmSetWindowAttribute_t DwmSetWindowAttribute_Original;
+
+// Whether a process is SearchHost.exe. Remembered per process id: the
+// location-change event fires for every window that moves on the desktop.
+bool IsSearchHostProcessId(DWORD processId) {
+    static std::mutex mutex;
+    static std::map<DWORD, bool> known;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        if (auto it = known.find(processId); it != known.end()) {
+            return it->second;
+        }
+    }
+    bool result = false;
+    if (HANDLE process =
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId)) {
+        WCHAR path[MAX_PATH];
+        DWORD size = ARRAYSIZE(path);
+        result = QueryFullProcessImageName(process, 0, path, &size) &&
+                 _wcsicmp(PathFindFileName(path), L"SearchHost.exe") == 0;
+        CloseHandle(process);
+    }
+    std::lock_guard<std::mutex> guard(mutex);
+    if (known.size() > 256) {
+        known.clear();  // process ids get reused: keep the cache small
+    }
+    known[processId] = result;
+    return result;
+}
+
+bool IsSearchHostWindow(HWND hWnd) {
+    DWORD processId = 0;
+    return GetWindowThreadProcessId(hWnd, &processId) &&
+           IsSearchHostProcessId(processId);
+}
+
+// The taskbar window on a monitor, or nullptr.
+HWND FindTaskbarOnMonitor(HMONITOR monitor) {
+    for (PCWSTR className : {L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd"}) {
+        HWND hWnd = nullptr;
+        while ((hWnd = FindWindowEx(nullptr, hWnd, className, nullptr))) {
+            if (MonitorFromWindow(hWnd, MONITOR_DEFAULTTONULL) == monitor) {
+                return hWnd;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// The offset for a SearchHost window at a rect, or false when it isn't placed
+// for Windows' taskbar: not down to the screen edge (already moved up, so
+// moving again would add the offset twice) or taskbar not at the bottom. With
+// no edge margin dy is 0 and only the Start inset is left (dx).
+bool GetSearchWindowOffset(const RECT& window, int* dx, int* dy) {
+    HMONITOR monitor = MonitorFromRect(&window, MONITOR_DEFAULTTONEAREST);
+    RECT monitorRect;
+    HWND taskbar = FindTaskbarOnMonitor(monitor);
+    RECT taskbarRect;
+    TaskbarEdge edge;
+    if (!GetMonitorRect(monitor, &monitorRect) || !taskbar ||
+        !GetWindowRect(taskbar, &taskbarRect) ||
+        !GetTaskbarEdge(&taskbarRect, &edge) || edge.edge != ABE_BOTTOM) {
+        return false;
+    }
+    *dy = taskbarRect.bottom - monitorRect.bottom;
+    if (window.bottom != monitorRect.bottom || *dy > 0) {
+        return false;
+    }
+    UINT dpiX = 96;
+    UINT dpiY = 96;
+    GetDpiForMonitor(monitor, MDT_DEFAULT, &dpiX, &dpiY);
+    *dx = StartInsetPixels(dpiX / 96.0);
+    return *dx || *dy;
+}
+
+// Where each SearchHost window was last put: with no margin the window stays
+// on the edge after the move, so its bottom can't tell whether it was already
+// moved right; its left can.
+std::mutex g_searchMovedMutex;
+std::map<HWND, LONG> g_searchMovedLeft;
+
+void MoveSearchWindowToTaskbar(HWND hWnd, PCWSTR when) {
+    RECT window;
+    int dx = 0;
+    int dy = 0;
+    if (!GetWindowRect(hWnd, &window) ||
+        !GetSearchWindowOffset(window, &dx, &dy)) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> guard(g_searchMovedMutex);
+        auto it = g_searchMovedLeft.find(hWnd);
+        if (dy == 0 && it != g_searchMovedLeft.end() &&
+            it->second == window.left) {
+            return;  // already moved right, still in place
+        }
+        if (g_searchMovedLeft.size() > 16) {
+            g_searchMovedLeft.clear();
+        }
+        g_searchMovedLeft[hWnd] = window.left + dx;
+    }
+    DebugLog(L"Search window %08X moved by %d,%d (%s)",
+             (DWORD)(DWORD_PTR)hWnd, dx, dy, when);
+    SetWindowPos(hWnd, nullptr, window.left + dx, window.top + dy, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hWnd,
+                                          DWORD attribute,
+                                          LPCVOID value,
+                                          DWORD size) {
+    if (attribute == DWMWA_CLOAK && size == sizeof(BOOL) && value &&
+        !*(const BOOL*)value && IsActive() && IsSearchHostWindow(hWnd)) {
+        MoveSearchWindowToTaskbar(hWnd, L"uncloak");
+    }
+    return DwmSetWindowAttribute_Original(hWnd, attribute, value, size);
+}
+
+void CALLBACK SearchLocationEventProc(HWINEVENTHOOK,
+                                      DWORD,
+                                      HWND hWnd,
+                                      LONG idObject,
+                                      LONG idChild,
+                                      DWORD,
+                                      DWORD) {
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !hWnd ||
+        !IsActive() || GetAncestor(hWnd, GA_ROOT) != hWnd ||
+        !IsWindowVisible(hWnd) || !IsSearchHostWindow(hWnd)) {
+        return;
+    }
+    MoveSearchWindowToTaskbar(hWnd, L"moved");
+}
+
+// A thread of its own: out-of-context window events need a message loop.
+HANDLE g_searchWatcherThread;
+DWORD g_searchWatcherThreadId;
+
+DWORD WINAPI SearchWatcherThreadProc(LPVOID) {
+    HWINEVENTHOOK hook = SetWinEventHook(
+        EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, nullptr,
+        SearchLocationEventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    MSG msg;
+    while (GetMessage(&msg, nullptr, 0, 0) > 0) {
+        DispatchMessage(&msg);
+    }
+    if (hook) {
+        UnhookWinEvent(hook);
+    }
+    return 0;
+}
+
+void StartSearchWatcher() {
+    g_searchWatcherThread = CreateThread(nullptr, 0, SearchWatcherThreadProc,
+                                         nullptr, 0, &g_searchWatcherThreadId);
+}
+
+void StopSearchWatcher() {
+    if (!g_searchWatcherThread) {
+        return;
+    }
+    PostThreadMessage(g_searchWatcherThreadId, WM_QUIT, 0, 0);
+    WaitForSingleObject(g_searchWatcherThread, 5000);
+    CloseHandle(g_searchWatcherThread);
+    g_searchWatcherThread = nullptr;
+}
+
+////////////////////////////////////////////////////////////////////////////////
 
 BOOL Wh_ModInit() {
     LoadSettings();
@@ -5125,6 +5362,10 @@ BOOL Wh_ModInit() {
     WindhawkUtils::SetFunctionHook(SubtractRect, SubtractRect_Hook,
                                    &SubtractRect_Original);
 
+    WindhawkUtils::SetFunctionHook(DwmSetWindowAttribute,
+                                   DwmSetWindowAttribute_Hook,
+                                   &DwmSetWindowAttribute_Original);
+
     if (HMODULE user32Module = GetModuleHandle(L"user32.dll")) {
         pGetWindowCompositionAttribute =
             (GetWindowCompositionAttribute_t)GetProcAddress(
@@ -5162,6 +5403,7 @@ void Wh_ModAfterInit() {
     StartSettingsWatcher();
     StartUpdateThread();
     StartFolderIconsThread();
+    StartSearchWatcher();
 }
 
 void Wh_ModBeforeUninit() {
@@ -5171,6 +5413,7 @@ void Wh_ModBeforeUninit() {
     StopSettingsWatcher();
     StopUpdateThread();
     StopFolderIconsThread();
+    StopSearchWatcher();
     CloseSettingsWindow();
     UnregisterSettingsLink();
 
