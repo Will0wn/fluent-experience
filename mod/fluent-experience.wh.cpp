@@ -2,7 +2,7 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.24
+// @version         0.25
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
@@ -134,6 +134,8 @@ struct Settings {
     bool edgeMargin;
     bool terminalAcrylic;  // Acrylic: Windows Terminal with acrylic
     int terminalOpacity;   // Windows Terminal opacity, 0-100
+    bool appsMaterial;     // the material on app windows too
+    bool extendFrame;      // app windows: frame extended into the client area
     int margin;
     bool settingsButton;
     bool hiddenIconMenu;
@@ -294,6 +296,8 @@ Settings ReadSettings() {
     settings.terminalAcrylic = ReadIntSetting(key, L"terminalAcrylic", 0);
     settings.terminalOpacity =
         std::clamp(ReadIntSetting(key, L"terminalOpacity", 80), 0, 100);
+    settings.appsMaterial = ReadIntSetting(key, L"appsMaterial", 0);
+    settings.extendFrame = ReadIntSetting(key, L"extendFrame", 0);
     settings.margin = std::clamp(ReadIntSetting(key, L"margin", 8), 0, 200);
     settings.settingsButton = ReadIntSetting(key, L"settingsButton", 1);
     settings.hiddenIconMenu = ReadIntSetting(key, L"hiddenIconMenu", 1);
@@ -3677,6 +3681,7 @@ constexpr SettingsText kSettingsTexts[] = {
     {L"Acrylic", L"Acrylic", L"Acrilico"},
     {L"Mica", L"Mica", L"Mica"},
     {L"MicaAlt", L"Mica Alt", L"Mica Alt"},
+    {L"Taskbar", L"Taskbar", L"Barra delle applicazioni"},
     {L"RoundedCorners", L"Rounded corners", L"Angoli arrotondati"},
     {L"RoundedCornersDesc",
      L"Windows 11 rounded corners with the Default material. Always on with "
@@ -3689,6 +3694,24 @@ constexpr SettingsText kSettingsTexts[] = {
      L"every window",
      L"Toglie la linea sottile che Windows 11 disegna attorno alla barra delle "
      L"applicazioni, come attorno a ogni finestra"},
+    {L"Windows", L"Windows", L"Finestre"},
+    {L"AppsMaterial", L"Material on app windows",
+     L"Materiale sulle finestre delle app"},
+    {L"AppsMaterialDesc",
+     L"App windows get the material chosen above, behind the title bar and "
+     L"borders",
+     L"Le finestre delle app prendono il materiale scelto sopra, dietro la "
+     L"barra del titolo e i bordi"},
+    {L"AppsWarning",
+     L"Extend frame into client area can break how some apps draw their "
+     L"windows. Save your work before turning it on.",
+     L"Estendi la cornice all'area client può rompere la grafica di alcune "
+     L"app. Salva il lavoro prima di attivarla."},
+    {L"ExtendFrame", L"Extend frame into client area",
+     L"Estendi la cornice all'area client"},
+    {L"ExtendFrameDesc",
+     L"The material shows behind the whole window, content included",
+     L"Il materiale si vede dietro tutta la finestra, contenuto compreso"},
     {L"Terminal", L"Windows Terminal", L"Windows Terminal"},
     {L"TerminalDesc",
      L"Acrylic and transparency in Windows Terminal",
@@ -3821,6 +3844,7 @@ constexpr PCWSTR kResettableSettings[] = {
     L"edgeMargin", L"margin",  L"settingsButton",    L"hiddenIconMenu", L"checkUpdates",
     L"folderIcons",
     L"terminalAcrylic", L"terminalOpacity",
+    L"appsMaterial", L"extendFrame",
     L"debugLog",
 };
 
@@ -3932,6 +3956,20 @@ std::wstring SliderXaml(PCWSTR name, int minimum, int maximum, int step) {
            LR"(" StepFrequency=")" + std::to_wstring(step) + LR"("/>)";
 }
 
+// A warning in a card of its own: yellow warning icon and full-strength text,
+// since the grey description style was too faint to notice (owner,
+// 2026-11-19).
+std::wstring WarningCardXaml(PCWSTR name) {
+    std::wstring n = name;
+    return LR"(<Grid x:Name=")" + n + LR"(Card" Style="{StaticResource CardStyle}">)"
+           LR"(<Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/>)"
+           LR"(<ColumnDefinition Width="*"/></Grid.ColumnDefinitions>)"
+           LR"(<FontIcon Glyph="&#xE7BA;" Style="{StaticResource CardIconStyle}" Foreground="#FFFFB900"/>)"
+           LR"(<TextBlock x:Name=")" + n + LR"(" Grid.Column="1" VerticalAlignment="Center")"
+           LR"( TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorPrimaryBrush}"/>)"
+           LR"(</Grid>)";
+}
+
 std::wstring SectionXaml(PCWSTR name) {
     return LR"(<TextBlock x:Name=")" + std::wstring(name) +
            LR"(Section" Style="{StaticResource SectionStyle}"/>)";
@@ -3985,29 +4023,30 @@ std::wstring SettingsPageXaml() {
     xaml += CardXaml(L"WhatsNew", L"E789", L"");
     xaml += CardXaml(L"Enabled", L"E7C4", ToggleXaml(L"Enabled"));
 
+    // What applies to everything.
     xaml += SectionXaml(L"Appearance");
     xaml += CardXaml(L"Material", L"F4A5",
                      LR"(<ComboBox x:Name="MaterialCombo" MinWidth="240"/>)");
+
+    xaml += SectionXaml(L"Taskbar");
     xaml += CardXaml(L"RoundedCorners", L"F16B", ToggleXaml(L"RoundedCorners"));
     xaml += CardXaml(L"Border", L"E81E", ToggleXaml(L"Border"));
+    xaml += CardXaml(L"Margin", L"E74B",
+                     SliderXaml(L"Margin", 0, 40, 1) + ToggleXaml(L"EdgeMargin"));
+    // Shown while the edge margin is on (owner, 2026-11-19).
+    xaml += WarningCardXaml(L"MarginWarning");
+    xaml += CardXaml(L"SettingsButton", L"E9E9", ToggleXaml(L"SettingsButton"));
+    xaml += CardXaml(L"HiddenIconMenu", L"E70E", ToggleXaml(L"HiddenIconMenu"));
+
+    xaml += SectionXaml(L"Windows");
     // Shown with Acrylic.
     xaml += CardXaml(L"Terminal", L"E756",
                      SliderXaml(L"TerminalOpacity", 0, 100, 1) +
                          ToggleXaml(L"TerminalAcrylic"));
-    xaml += CardXaml(L"Margin", L"E74B",
-                     SliderXaml(L"Margin", 0, 40, 1) + ToggleXaml(L"EdgeMargin"));
-    // Shown while the edge margin is on (owner, 2026-11-19).
-    xaml += LR"(<Grid x:Name="MarginWarningCard" Style="{StaticResource CardStyle}">)"
-            LR"(<Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/>)"
-            LR"(<ColumnDefinition Width="*"/></Grid.ColumnDefinitions>)"
-            // Yellow warning icon and full-strength text: the grey description
-            // style was too faint to notice (owner, 2026-11-19).
-            LR"(<FontIcon Glyph="&#xE7BA;" Style="{StaticResource CardIconStyle}" Foreground="#FFFFB900"/>)"
-            LR"(<TextBlock x:Name="MarginWarning" Grid.Column="1" VerticalAlignment="Center")"
-            LR"( TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorPrimaryBrush}"/>)"
-            LR"(</Grid>)";
-    xaml += CardXaml(L"SettingsButton", L"E9E9", ToggleXaml(L"SettingsButton"));
-    xaml += CardXaml(L"HiddenIconMenu", L"E70E", ToggleXaml(L"HiddenIconMenu"));
+    xaml += CardXaml(L"AppsMaterial", L"E923", ToggleXaml(L"AppsMaterial"));
+    xaml += CardXaml(L"ExtendFrame", L"E922", ToggleXaml(L"ExtendFrame"));
+    // Shown while extend frame is on.
+    xaml += WarningCardXaml(L"AppsWarning");
 
     xaml += SectionXaml(L"MultipleDisplays");
     xaml += CardXaml(L"AppsWhereOpen", L"E7F4", ToggleXaml(L"AppsWhereOpen"));
@@ -4157,6 +4196,15 @@ void UpdateSettingsUiStates() {
     SetCardEnabled(L"SettingsButton", L"SettingsButtonToggle", enabled);
     SetCardEnabled(L"HiddenIconMenu", L"HiddenIconMenuToggle",
                    enabled && !defaultMaterial);
+    SetCardEnabled(L"AppsMaterial", L"AppsMaterialToggle",
+                   enabled && !defaultMaterial);
+    bool appsMaterial =
+        enabled && !defaultMaterial && FindToggle(L"AppsMaterial").IsOn();
+    SetCardEnabled(L"ExtendFrame", L"ExtendFrameToggle", appsMaterial);
+    FindSettingsElement<Controls::Grid>(L"AppsWarningCard")
+        .Visibility(appsMaterial && FindToggle(L"ExtendFrame").IsOn()
+                        ? Visibility::Visible
+                        : Visibility::Collapsed);
     SetCardEnabled(L"DynamicWidth", L"DynamicWidthToggle", enabled);
     SetCardEnabled(L"Width", L"WidthBox", enabled && !dynamicWidth);
     SetCardEnabled(L"Padding", L"PaddingSlider", enabled && dynamicWidth);
@@ -4322,9 +4370,15 @@ void LoadSettingsUi() {
     SetCardTexts(L"Enabled", Text(L"Enabled"), Text(L"EnabledDesc"));
     SetSettingsText(L"AppearanceSection", Text(L"Appearance"));
     SetCardTexts(L"Material", Text(L"Material"), Text(L"MaterialDesc"));
+    SetSettingsText(L"TaskbarSection", Text(L"Taskbar"));
     SetCardTexts(L"RoundedCorners", Text(L"RoundedCorners"),
                  Text(L"RoundedCornersDesc"));
     SetCardTexts(L"Border", Text(L"Border"), Text(L"BorderDesc"));
+    SetSettingsText(L"WindowsSection", Text(L"Windows"));
+    SetCardTexts(L"AppsMaterial", Text(L"AppsMaterial"),
+                 Text(L"AppsMaterialDesc"));
+    SetSettingsText(L"AppsWarning", Text(L"AppsWarning"));
+    SetCardTexts(L"ExtendFrame", Text(L"ExtendFrame"), Text(L"ExtendFrameDesc"));
     SetCardTexts(L"Terminal", Text(L"Terminal"), Text(L"TerminalDesc"));
     SetCardTexts(L"Margin", Text(L"Margin"), Text(L"MarginDesc"));
     SetSettingsText(L"MarginWarning", Text(L"MarginWarning"));
@@ -4365,6 +4419,7 @@ void LoadSettingsUi() {
     for (PCWSTR name : {L"Enabled", L"RoundedCorners", L"Border",
                         L"SettingsButton", L"HiddenIconMenu", L"AppsWhereOpen",
                         L"DynamicWidth", L"FolderIcons", L"EdgeMargin", L"TerminalAcrylic",
+                        L"AppsMaterial", L"ExtendFrame",
                         L"CheckUpdates", L"DebugLog"}) {
         auto toggle = FindToggle(name);
         toggle.OnContent(winrt::box_value(winrt::hstring(Text(L"On"))));
@@ -4388,6 +4443,8 @@ void LoadSettingsUi() {
     FindToggle(L"Border").IsOn(!settings.border);
     FindSlider(L"TerminalOpacity").Value(settings.terminalOpacity);
     FindToggle(L"TerminalAcrylic").IsOn(settings.terminalAcrylic);
+    FindToggle(L"AppsMaterial").IsOn(settings.appsMaterial);
+    FindToggle(L"ExtendFrame").IsOn(settings.extendFrame);
     FindSlider(L"Margin").Value(settings.margin);
     FindToggle(L"EdgeMargin").IsOn(settings.edgeMargin);
     FindToggle(L"SettingsButton").IsOn(settings.settingsButton);
@@ -4445,6 +4502,8 @@ void ConnectSettingsUi() {
     ConnectToggle(L"DebugLog", L"debugLog");
     ConnectSlider(L"TerminalOpacity", L"terminalOpacity");
     ConnectToggle(L"TerminalAcrylic", L"terminalAcrylic");
+    ConnectToggle(L"AppsMaterial", L"appsMaterial");
+    ConnectToggle(L"ExtendFrame", L"extendFrame");
     ConnectSlider(L"Margin", L"margin");
     ConnectToggle(L"EdgeMargin", L"edgeMargin");
     ConnectSlider(L"Width", L"width");
@@ -4895,6 +4954,8 @@ void CloseSettingsWindow() {
 HANDLE g_settingsWatcherThread;
 HANDLE g_settingsWatcherStopEvent;
 
+void UpdateAppWindows();
+
 void ReloadSettings() {
     LoadSettings();
 
@@ -4906,6 +4967,7 @@ void ReloadSettings() {
     }
 
     ApplySettings();
+    UpdateAppWindows();
 
     if (g_folderIconsChangedEvent) {
         SetEvent(g_folderIconsChangedEvent);
@@ -5698,6 +5760,226 @@ void StopSearchWatcher() {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// App windows
+//
+// The material on app windows, as Mica For Everyone does: Windows' own system
+// backdrop, set on each window from outside through DWM. Extend frame lets the
+// backdrop show through the client area too, and can break how an app draws.
+// Turning them off, or unloading the mod, puts the windows back.
+
+constexpr UINT kAppWindowsApplyMsg = WM_APP + 1;
+
+struct AppWindowStyle {
+    DWORD originalBackdrop;
+    bool extendFrame;
+};
+
+// Used only on the app windows thread.
+std::unordered_map<HWND, AppWindowStyle> g_styledAppWindows;
+
+// Windows Terminal, managed by Fluent only (the Terminal card).
+constexpr WCHAR kTerminalWindowClass[] = L"CASCADIA_HOSTING_WINDOW_CLASS";
+
+bool StyleAppWindows() {
+    return UseWindowsMaterial() && g_settings.appsMaterial;
+}
+
+// Top-level windows with a title bar, the same choice Mica For Everyone makes;
+// the taskbar, the settings window and Windows Terminal have their own.
+bool IsAppWindow(HWND hWnd) {
+    if (!IsWindowVisible(hWnd) || GetAncestor(hWnd, GA_ROOT) != hWnd ||
+        hWnd == g_settingsWindow || IsTaskbarWindow(hWnd) ||
+        IsHiddenIconMenuWindow(hWnd)) {
+        return false;
+    }
+
+    WCHAR className[64];
+    if (GetClassName(hWnd, className, ARRAYSIZE(className)) &&
+        wcscmp(className, kTerminalWindowClass) == 0) {
+        return false;
+    }
+
+    LONG_PTR style = GetWindowLongPtr(hWnd, GWL_STYLE);
+    LONG_PTR exStyle = GetWindowLongPtr(hWnd, GWL_EXSTYLE);
+    if (exStyle & (WS_EX_NOACTIVATE | WS_EX_TRANSPARENT)) {
+        return false;
+    }
+
+    bool hasTitleBar = (style & WS_CAPTION) == WS_CAPTION;
+    if (!hasTitleBar && ((exStyle & WS_EX_TOOLWINDOW) || (style & WS_POPUP))) {
+        return false;
+    }
+
+    return true;
+}
+
+DWORD AppWindowBackdrop() {
+    switch (g_settings.material) {
+        case Material::mica:
+            return kDwmsbtMainWindow;
+        case Material::micaAlt:
+            return kDwmsbtTabbedWindow;
+        case Material::acrylic:
+        case Material::windowsDefault:
+            break;
+    }
+    return kDwmsbtTransientWindow;
+}
+
+// Console windows (conhost) turn white with the frame extended, text included.
+bool IsConsoleWindow(HWND hWnd) {
+    WCHAR className[64];
+    return GetClassName(hWnd, className, ARRAYSIZE(className)) &&
+           wcscmp(className, L"ConsoleWindowClass") == 0;
+}
+
+// The frame is touched only to extend it or to turn that off: apps like
+// Explorer extend it by themselves.
+void SetAppWindowFrame(HWND hWnd, bool extendFrame) {
+    MARGINS margins = extendFrame ? MARGINS{-1, -1, -1, -1} : MARGINS{};
+    DwmExtendFrameIntoClientArea(hWnd, &margins);
+}
+
+void StyleAppWindow(HWND hWnd) {
+    auto it = g_styledAppWindows.find(hWnd);
+    AppWindowStyle style{};
+    if (it != g_styledAppWindows.end()) {
+        style = it->second;
+    } else if (FAILED(DwmGetWindowAttribute(hWnd, kDwmwaSystemBackdropType,
+                                            &style.originalBackdrop,
+                                            sizeof(style.originalBackdrop)))) {
+        style.originalBackdrop = kDwmsbtAuto;
+    }
+
+    DWORD backdrop = AppWindowBackdrop();
+    HRESULT hr = DwmSetWindowAttribute(hWnd, kDwmwaSystemBackdropType,
+                                       &backdrop, sizeof(backdrop));
+
+    bool extendFrame = g_settings.extendFrame && !IsConsoleWindow(hWnd);
+    if (extendFrame || style.extendFrame) {
+        SetAppWindowFrame(hWnd, extendFrame);
+    }
+
+    style.extendFrame = extendFrame;
+    g_styledAppWindows[hWnd] = style;
+
+    DebugLog(L"App window %p: backdrop %u (%08X), extend frame %d", hWnd,
+             backdrop, hr, extendFrame);
+}
+
+void UnstyleAppWindow(HWND hWnd, const AppWindowStyle& style) {
+    if (!IsWindow(hWnd)) {
+        return;
+    }
+    DwmSetWindowAttribute(hWnd, kDwmwaSystemBackdropType,
+                          &style.originalBackdrop,
+                          sizeof(style.originalBackdrop));
+    if (style.extendFrame) {
+        SetAppWindowFrame(hWnd, false);
+    }
+}
+
+void UnstyleAppWindows() {
+    for (const auto& [hWnd, style] : g_styledAppWindows) {
+        UnstyleAppWindow(hWnd, style);
+    }
+    g_styledAppWindows.clear();
+}
+
+void ApplyAppWindows() {
+    if (!StyleAppWindows()) {
+        UnstyleAppWindows();
+        return;
+    }
+
+    // Windows left out since they were styled.
+    for (auto it = g_styledAppWindows.begin(); it != g_styledAppWindows.end();) {
+        if (IsWindow(it->first) && IsAppWindow(it->first)) {
+            ++it;
+            continue;
+        }
+        UnstyleAppWindow(it->first, it->second);
+        it = g_styledAppWindows.erase(it);
+    }
+
+    EnumWindows(
+        [](HWND hWnd, LPARAM) -> BOOL {
+            if (IsAppWindow(hWnd)) {
+                StyleAppWindow(hWnd);
+            }
+            return TRUE;
+        },
+        0);
+}
+
+void CALLBACK AppWindowEventProc(HWINEVENTHOOK,
+                                 DWORD event,
+                                 HWND hWnd,
+                                 LONG idObject,
+                                 LONG idChild,
+                                 DWORD,
+                                 DWORD) {
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !hWnd) {
+        return;
+    }
+    if (event == EVENT_OBJECT_DESTROY) {
+        g_styledAppWindows.erase(hWnd);
+        return;
+    }
+    if (StyleAppWindows() && IsAppWindow(hWnd)) {
+        StyleAppWindow(hWnd);
+    }
+}
+
+// A thread of its own: out-of-context window events need a message loop.
+HANDLE g_appWindowsThread;
+DWORD g_appWindowsThreadId;
+
+DWORD WINAPI AppWindowsThreadProc(LPVOID) {
+    HWINEVENTHOOK hook =
+        SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW, nullptr,
+                        AppWindowEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+    ApplyAppWindows();
+
+    MSG msg;
+    while (GetMessage(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == kAppWindowsApplyMsg) {
+            ApplyAppWindows();
+            continue;
+        }
+        DispatchMessage(&msg);
+    }
+
+    if (hook) {
+        UnhookWinEvent(hook);
+    }
+    UnstyleAppWindows();
+    return 0;
+}
+
+void StartAppWindowsThread() {
+    g_appWindowsThread = CreateThread(nullptr, 0, AppWindowsThreadProc, nullptr,
+                                      0, &g_appWindowsThreadId);
+}
+
+// After a settings change.
+void UpdateAppWindows() {
+    if (g_appWindowsThread) {
+        PostThreadMessage(g_appWindowsThreadId, kAppWindowsApplyMsg, 0, 0);
+    }
+}
+
+void StopAppWindowsThread() {
+    if (!g_appWindowsThread) {
+        return;
+    }
+    PostThreadMessage(g_appWindowsThreadId, WM_QUIT, 0, 0);
+    WaitForSingleObject(g_appWindowsThread, 5000);
+    CloseHandle(g_appWindowsThread);
+    g_appWindowsThread = nullptr;
+}
+
+////////////////////////////////////////////////////////////////////////////////
 
 BOOL Wh_ModInit() {
     LoadSettings();
@@ -5747,6 +6029,7 @@ BOOL Wh_ModInit() {
                                    DwmSetWindowAttribute_Hook,
                                    &DwmSetWindowAttribute_Original);
 
+
     if (HMODULE user32Module = GetModuleHandle(L"user32.dll")) {
         pGetWindowCompositionAttribute =
             (GetWindowCompositionAttribute_t)GetProcAddress(
@@ -5785,6 +6068,7 @@ void Wh_ModAfterInit() {
     StartUpdateThread();
     StartFolderIconsThread();
     StartSearchWatcher();
+    StartAppWindowsThread();
 }
 
 void Wh_ModBeforeUninit() {
@@ -5795,6 +6079,7 @@ void Wh_ModBeforeUninit() {
     StopUpdateThread();
     StopFolderIconsThread();
     StopSearchWatcher();
+    StopAppWindowsThread();
     CloseSettingsWindow();
     UnregisterSettingsLink();
 
@@ -5812,4 +6097,5 @@ void Wh_ModUninit() {
     while (g_hookCallCounter > 0) {
         Sleep(100);
     }
+
 }
