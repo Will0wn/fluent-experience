@@ -2,7 +2,7 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.23
+// @version         0.24
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
@@ -132,6 +132,8 @@ struct Settings {
     int padding;
     int animationDuration;
     bool edgeMargin;
+    bool terminalAcrylic;  // Acrylic: Windows Terminal with acrylic
+    int terminalOpacity;   // Windows Terminal opacity, 0-100
     int margin;
     bool settingsButton;
     bool hiddenIconMenu;
@@ -289,6 +291,9 @@ Settings ReadSettings() {
     // Search draw for a taskbar on the edge hangs over the desktop (RECAP, Open
     // items 9). Turned on, the taskbar floats by `margin` and a warning says so.
     settings.edgeMargin = ReadIntSetting(key, L"edgeMargin", 0);
+    settings.terminalAcrylic = ReadIntSetting(key, L"terminalAcrylic", 0);
+    settings.terminalOpacity =
+        std::clamp(ReadIntSetting(key, L"terminalOpacity", 80), 0, 100);
     settings.margin = std::clamp(ReadIntSetting(key, L"margin", 8), 0, 200);
     settings.settingsButton = ReadIntSetting(key, L"settingsButton", 1);
     settings.hiddenIconMenu = ReadIntSetting(key, L"hiddenIconMenu", 1);
@@ -2593,11 +2598,210 @@ HWND FindCurrentProcessTaskbarWnd() {
 }
 
 // Makes Explorer recompute the geometry of all taskbars.
+////////////////////////////////////////////////////////////////////////////////
+// Windows Terminal acrylic
+//
+// With Acrylic and its toggle on, Windows Terminal's own options "useAcrylic"
+// and "opacity" are set for all profiles (profiles.defaults in its
+// settings.json, which it reloads at once). The user's values are saved the
+// first time and put back, or removed if they weren't there, when it's off.
+
+std::wstring TerminalSettingsPath() {
+    WCHAR local[MAX_PATH];
+    DWORD len = GetEnvironmentVariable(L"LOCALAPPDATA", local, ARRAYSIZE(local));
+    if (!len || len >= ARRAYSIZE(local)) {
+        return L"";
+    }
+    return std::wstring(local) +
+           LR"(\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json)";
+}
+
+// The end of the JSON value starting at pos: the next ',' or closing bracket
+// at its own depth, skipping strings.
+size_t JsonValueEnd(const std::string& text, size_t pos) {
+    int depth = 0;
+    for (; pos < text.size(); pos++) {
+        char c = text[pos];
+        if (c == '"') {
+            for (pos++; pos < text.size() && text[pos] != '"'; pos++) {
+                if (text[pos] == '\\') {
+                    pos++;
+                }
+            }
+        } else if (c == '{' || c == '[') {
+            depth++;
+        } else if (c == '}' || c == ']') {
+            if (depth-- == 0) {
+                break;
+            }
+        } else if (c == ',' && depth == 0) {
+            break;
+        }
+    }
+    return pos;
+}
+
+// The position of "key" directly inside the object whose '{' is at open, or
+// npos (also when something unexpected, like a comment, is in the way).
+size_t JsonFindMember(const std::string& text, size_t open, const std::string& key) {
+    std::string quoted = "\"" + key + "\"";
+    size_t pos = open + 1;
+    while (true) {
+        pos = text.find_first_not_of(" \t\r\n,", pos);
+        if (pos == std::string::npos || text[pos] != '"') {
+            return std::string::npos;
+        }
+        if (text.compare(pos, quoted.size(), quoted) == 0) {
+            return pos;
+        }
+        size_t colon = text.find(':', pos);
+        if (colon == std::string::npos) {
+            return std::string::npos;
+        }
+        pos = JsonValueEnd(text, colon + 1);
+    }
+}
+
+// The '{' of the object value of "key" inside the object at open, or npos.
+size_t JsonFindObject(const std::string& text, size_t open, const std::string& key) {
+    size_t member = JsonFindMember(text, open, key);
+    if (member == std::string::npos) {
+        return std::string::npos;
+    }
+    size_t brace = text.find_first_not_of(" \t\r\n:", member + key.size() + 2);
+    return brace != std::string::npos && text[brace] == '{' ? brace
+                                                           : std::string::npos;
+}
+
+// Sets a member of the object at open to a raw JSON value; with no value,
+// removes it. Returns its previous raw value, empty if it wasn't there.
+std::string JsonSetMember(std::string* text,
+                          size_t open,
+                          const std::string& key,
+                          const std::string& value) {
+    size_t member = JsonFindMember(*text, open, key);
+    if (member == std::string::npos) {
+        if (!value.empty()) {
+            size_t next = text->find_first_not_of(" \t\r\n", open + 1);
+            bool empty = next != std::string::npos && (*text)[next] == '}';
+            text->insert(open + 1, "\n            \"" + key + "\": " + value +
+                                       (empty ? "\n        " : ","));
+        }
+        return "";
+    }
+
+    size_t start = text->find_first_not_of(" \t\r\n:", member + key.size() + 2);
+    size_t end = JsonValueEnd(*text, start);
+    std::string previous = text->substr(start, end - start);
+    while (!previous.empty() && isspace((unsigned char)previous.back())) {
+        previous.pop_back();
+    }
+
+    if (!value.empty()) {
+        text->replace(start, previous.size(), value);
+    } else {
+        // The member and its comma: the one after it, else the one before.
+        size_t from = member, to = end;
+        if (to < text->size() && (*text)[to] == ',') {
+            to++;
+            // and the rest of its line, so no empty line is left
+            size_t eol = text->find_first_not_of(" \t\r", to);
+            if (eol != std::string::npos && (*text)[eol] == '\n') {
+                to = eol + 1;
+            }
+        } else {
+            size_t comma = text->find_last_not_of(" \t\r\n", member - 1);
+            if (comma != std::string::npos && (*text)[comma] == ',') {
+                from = comma;
+            }
+        }
+        from = text->find_last_not_of(" \t", from - 1) + 1;
+        text->erase(from, to - from);
+        // An object left empty goes back to "{}".
+        size_t next = text->find_first_not_of(" \t\r\n", open + 1);
+        if (next != std::string::npos && (*text)[next] == '}') {
+            text->erase(open + 1, next - open - 1);
+        }
+    }
+    return previous;
+}
+
+void ApplyTerminalAcrylic() {
+    std::wstring path = TerminalSettingsPath();
+    HANDLE file = CreateFile(path.c_str(), GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                             OPEN_EXISTING, 0, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    std::string text(GetFileSize(file, nullptr), '\0');
+    DWORD read = 0;
+    ReadFile(file, text.data(), (DWORD)text.size(), &read, nullptr);
+    CloseHandle(file);
+    text.resize(read);
+
+    size_t root = text.find('{');
+    size_t profiles = root == std::string::npos
+                          ? std::string::npos
+                          : JsonFindObject(text, root, "profiles");
+    size_t defaults = profiles == std::string::npos
+                          ? std::string::npos
+                          : JsonFindObject(text, profiles, "defaults");
+    if (defaults == std::string::npos) {
+        DebugLog(L"Terminal: no profiles.defaults");
+        return;
+    }
+
+    bool on = IsActive() && g_settings.material == Material::acrylic &&
+              g_settings.terminalAcrylic;
+    std::string original = text;
+    const std::pair<const char*, std::string> values[] = {
+        {"useAcrylic", "true"},
+        {"opacity", std::to_string(g_settings.terminalOpacity)},
+    };
+    for (const auto& [key, value] : values) {
+        std::wstring savedName = L"savedTerminal_";
+        savedName += std::wstring(key, key + strlen(key));
+        WCHAR saved[256];
+        DWORD size = sizeof(saved);
+        bool hasSaved = RegGetValue(HKEY_CURRENT_USER, kSettingsSubKey,
+                                    savedName.c_str(), RRF_RT_REG_SZ, nullptr,
+                                    saved, &size) == ERROR_SUCCESS;
+        if (on) {
+            std::string previous = JsonSetMember(&text, defaults, key, value);
+            if (!hasSaved) {
+                std::wstring wide(previous.begin(), previous.end());
+                RegSetKeyValue(HKEY_CURRENT_USER, kSettingsSubKey, savedName.c_str(),
+                               REG_SZ, wide.c_str(),
+                               (DWORD)((wide.size() + 1) * sizeof(WCHAR)));
+            }
+        } else if (hasSaved) {
+            std::wstring wide = saved;
+            JsonSetMember(&text, defaults, key, std::string(wide.begin(), wide.end()));
+            RegDeleteKeyValue(HKEY_CURRENT_USER, kSettingsSubKey, savedName.c_str());
+        }
+    }
+
+    if (text == original) {
+        return;
+    }
+    file = CreateFile(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                      FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(file, text.data(), (DWORD)text.size(), &written, nullptr);
+        CloseHandle(file);
+    }
+    DebugLog(L"Terminal: acrylic %d, opacity %d", on, g_settings.terminalOpacity);
+}
+
 void ApplySettings() {
     HWND hTaskbarWnd = FindCurrentProcessTaskbarWnd();
     if (!hTaskbarWnd) {
         return;
     }
+
+    ApplyTerminalAcrylic();
 
     g_applyingSettings = true;
 
@@ -3485,6 +3689,10 @@ constexpr SettingsText kSettingsTexts[] = {
      L"every window",
      L"Toglie la linea sottile che Windows 11 disegna attorno alla barra delle "
      L"applicazioni, come attorno a ogni finestra"},
+    {L"Terminal", L"Windows Terminal", L"Windows Terminal"},
+    {L"TerminalDesc",
+     L"Acrylic and transparency in Windows Terminal",
+     L"Acrilico e trasparenza in Windows Terminal"},
     {L"Margin", L"Edge margin", L"Margine dal bordo"},
     {L"MarginDesc",
      L"Gap between the taskbar and the edge of the screen",
@@ -3612,6 +3820,7 @@ constexpr PCWSTR kResettableSettings[] = {
     L"dynamicWidth", L"width",        L"padding", L"animationDuration",
     L"edgeMargin", L"margin",  L"settingsButton",    L"hiddenIconMenu", L"checkUpdates",
     L"folderIcons",
+    L"terminalAcrylic", L"terminalOpacity",
     L"debugLog",
 };
 
@@ -3781,6 +3990,10 @@ std::wstring SettingsPageXaml() {
                      LR"(<ComboBox x:Name="MaterialCombo" MinWidth="240"/>)");
     xaml += CardXaml(L"RoundedCorners", L"F16B", ToggleXaml(L"RoundedCorners"));
     xaml += CardXaml(L"Border", L"E81E", ToggleXaml(L"Border"));
+    // Shown with Acrylic.
+    xaml += CardXaml(L"Terminal", L"E756",
+                     SliderXaml(L"TerminalOpacity", 0, 100, 1) +
+                         ToggleXaml(L"TerminalAcrylic"));
     xaml += CardXaml(L"Margin", L"E74B",
                      SliderXaml(L"Margin", 0, 40, 1) + ToggleXaml(L"EdgeMargin"));
     // Shown while the edge margin is on (owner, 2026-11-19).
@@ -3929,6 +4142,12 @@ void UpdateSettingsUiStates() {
     SetCardEnabled(L"Border", L"BorderToggle",
                    enabled && (!defaultMaterial ||
                                FindToggle(L"RoundedCorners").IsOn()));
+    FindSettingsElement<Controls::Grid>(L"TerminalCard")
+        .Visibility(SelectedTag(L"MaterialCombo") == L"acrylic" ? Visibility::Visible
+                                                              : Visibility::Collapsed);
+    SetCardEnabled(L"Terminal", L"TerminalAcrylicToggle", enabled);
+    FindSlider(L"TerminalOpacity")
+        .IsEnabled(enabled && FindToggle(L"TerminalAcrylic").IsOn());
     bool edgeMargin = FindToggle(L"EdgeMargin").IsOn();
     SetCardEnabled(L"Margin", L"EdgeMarginToggle", enabled);
     FindSlider(L"Margin").IsEnabled(enabled && edgeMargin);
@@ -3945,6 +4164,8 @@ void UpdateSettingsUiStates() {
 }
 
 void UpdateSettingsUiLabels() {
+    SetSettingsText(L"TerminalOpacityValue",
+                    (std::to_wstring((int)FindSlider(L"TerminalOpacity").Value()) + L"%").c_str());
     SetSettingsText(L"MarginValue",
                     (std::to_wstring((int)FindSlider(L"Margin").Value()) + L" px").c_str());
     SetSettingsText(L"PaddingValue",
@@ -4104,6 +4325,7 @@ void LoadSettingsUi() {
     SetCardTexts(L"RoundedCorners", Text(L"RoundedCorners"),
                  Text(L"RoundedCornersDesc"));
     SetCardTexts(L"Border", Text(L"Border"), Text(L"BorderDesc"));
+    SetCardTexts(L"Terminal", Text(L"Terminal"), Text(L"TerminalDesc"));
     SetCardTexts(L"Margin", Text(L"Margin"), Text(L"MarginDesc"));
     SetSettingsText(L"MarginWarning", Text(L"MarginWarning"));
     SetCardTexts(L"SettingsButton", Text(L"SettingsButton"),
@@ -4142,7 +4364,7 @@ void LoadSettingsUi() {
 
     for (PCWSTR name : {L"Enabled", L"RoundedCorners", L"Border",
                         L"SettingsButton", L"HiddenIconMenu", L"AppsWhereOpen",
-                        L"DynamicWidth", L"FolderIcons", L"EdgeMargin",
+                        L"DynamicWidth", L"FolderIcons", L"EdgeMargin", L"TerminalAcrylic",
                         L"CheckUpdates", L"DebugLog"}) {
         auto toggle = FindToggle(name);
         toggle.OnContent(winrt::box_value(winrt::hstring(Text(L"On"))));
@@ -4164,6 +4386,8 @@ void LoadSettingsUi() {
     SelectTag(L"MaterialCombo", material);
     FindToggle(L"RoundedCorners").IsOn(settings.roundedCorners);
     FindToggle(L"Border").IsOn(!settings.border);
+    FindSlider(L"TerminalOpacity").Value(settings.terminalOpacity);
+    FindToggle(L"TerminalAcrylic").IsOn(settings.terminalAcrylic);
     FindSlider(L"Margin").Value(settings.margin);
     FindToggle(L"EdgeMargin").IsOn(settings.edgeMargin);
     FindToggle(L"SettingsButton").IsOn(settings.settingsButton);
@@ -4219,6 +4443,8 @@ void ConnectSettingsUi() {
     ConnectToggle(L"HiddenIconMenu", L"hiddenIconMenu");
     ConnectToggle(L"FolderIcons", L"folderIcons");
     ConnectToggle(L"DebugLog", L"debugLog");
+    ConnectSlider(L"TerminalOpacity", L"terminalOpacity");
+    ConnectToggle(L"TerminalAcrylic", L"terminalAcrylic");
     ConnectSlider(L"Margin", L"margin");
     ConnectToggle(L"EdgeMargin", L"edgeMargin");
     ConnectSlider(L"Width", L"width");
