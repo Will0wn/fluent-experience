@@ -2,7 +2,7 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.21
+// @version         0.22
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
@@ -233,6 +233,25 @@ std::wstring ReadStringSetting(HKEY key, PCWSTR name, PCWSTR defaultValue) {
         return defaultValue;
     }
 
+    return value;
+}
+
+// A string value of any length, like the release notes.
+std::wstring ReadLongStringSetting(PCWSTR name) {
+    DWORD size = 0;
+    if (RegGetValue(HKEY_CURRENT_USER, kSettingsSubKey, name, RRF_RT_REG_SZ,
+                    nullptr, nullptr, &size) != ERROR_SUCCESS ||
+        size < sizeof(WCHAR)) {
+        return L"";
+    }
+
+    std::wstring value(size / sizeof(WCHAR), L'\0');
+    if (RegGetValue(HKEY_CURRENT_USER, kSettingsSubKey, name, RRF_RT_REG_SZ,
+                    nullptr, value.data(), &size) != ERROR_SUCCESS) {
+        return L"";
+    }
+
+    value.resize(wcslen(value.c_str()));
     return value;
 }
 
@@ -3437,6 +3456,7 @@ struct SettingsText {
 constexpr SettingsText kSettingsTexts[] = {
     {L"WindowTitle", L"Fluent Experience Settings",
      L"Impostazioni di Fluent Experience"},
+    {L"WhatsNew", L"What's new", L"Novità"},
 
     {L"Enabled", L"Fluent Experience", L"Fluent Experience"},
     {L"EnabledDesc", L"Turn off to restore the original Windows taskbar",
@@ -3752,6 +3772,8 @@ std::wstring SettingsPageXaml() {
         LR"(<TextBlock Text="Fluent Experience" Style="{StaticResource TitleTextBlockStyle}")"
         LR"( Foreground="{ThemeResource TextFillColorPrimaryBrush}" Margin="0,0,0,20"/>)";
 
+    // The notes of the installed version, from its GitHub release.
+    xaml += CardXaml(L"WhatsNew", L"E789", L"");
     xaml += CardXaml(L"Enabled", L"E7C4", ToggleXaml(L"Enabled"));
 
     xaml += SectionXaml(L"Appearance");
@@ -3963,8 +3985,49 @@ std::wstring FormatCheckTime(const SYSTEMTIME& time) {
     return day + L", " + timeText;
 }
 
+// Release notes are written as "Topic: text. Other topic: text.": each topic
+// goes on its own line. A topic is a sentence start of up to four words
+// followed by a colon.
+std::wstring FormatWhatsNew(const std::wstring& notes) {
+    std::wstring result;
+    size_t pos = 0;
+    while (pos < notes.size()) {
+        size_t next = notes.find(L". ", pos);
+        if (next == std::wstring::npos) {
+            result += notes.substr(pos);
+            break;
+        }
+
+        result += notes.substr(pos, next + 1 - pos);
+        pos = next + 2;
+
+        size_t colon = notes.find(L':', pos);
+        size_t stop = notes.find_first_of(L".,;\n", pos);
+        bool topic = colon != std::wstring::npos && colon < stop &&
+                     std::count(notes.begin() + pos, notes.begin() + colon,
+                                L' ') < 4;
+        result += topic ? L"\n\n" : L" ";
+    }
+
+    return result;
+}
+
+// What's new, once the notes of this version have been downloaded.
+void UpdateWhatsNewUi() {
+    std::wstring notes;
+    if (ReadLongStringSetting(L"whatsNewVersion") == WH_MOD_VERSION) {
+        notes = FormatWhatsNew(ReadLongStringSetting(L"whatsNew"));
+    }
+
+    SetCardTexts(L"WhatsNew", Text(L"WhatsNew"), notes.c_str());
+    FindSettingsElement<Controls::Grid>(L"WhatsNewCard")
+        .Visibility(notes.empty() ? Visibility::Collapsed : Visibility::Visible);
+}
+
 // The Updates card, from the update state.
 void UpdateUpdateUi() {
+    UpdateWhatsNewUi();
+
     UpdateInfo info = GetUpdateInfo();
 
     std::wstring header;
@@ -4921,6 +4984,87 @@ void CheckForUpdates() {
              info.version.c_str());
 }
 
+// The release notes ("body") in a release's JSON, with escapes decoded.
+std::wstring JsonReleaseBody(const std::string& json) {
+    size_t pos = json.find("\"body\"");
+    if (pos == std::string::npos) {
+        return L"";
+    }
+    pos = json.find_first_not_of(" \t\r\n", pos + 6);
+    if (pos == std::string::npos || json[pos] != ':') {
+        return L"";
+    }
+    pos = json.find_first_not_of(" \t\r\n", pos + 1);
+    if (pos == std::string::npos || json[pos] != '"') {
+        return L"";  // null: no notes
+    }
+
+    std::string utf8;
+    for (pos++; pos < json.size() && json[pos] != '"'; pos++) {
+        char c = json[pos];
+        if (c != '\\' || pos + 1 >= json.size()) {
+            utf8 += c;
+            continue;
+        }
+
+        char e = json[++pos];
+        if (e == 'n') {
+            utf8 += '\n';
+        } else if (e == 't') {
+            utf8 += '\t';
+        } else if (e == 'r' || e == 'b' || e == 'f') {
+            // Dropped: Windows line ends come in as \r\n.
+        } else if (e == 'u' && pos + 4 < json.size()) {
+            unsigned code = strtoul(json.substr(pos + 1, 4).c_str(), nullptr, 16);
+            pos += 4;
+            // Encoded as UTF-8; surrogate pairs come out as two halves, which
+            // the conversion below replaces.
+            if (code < 0x80) {
+                utf8 += (char)code;
+            } else if (code < 0x800) {
+                utf8 += (char)(0xC0 | (code >> 6));
+                utf8 += (char)(0x80 | (code & 0x3F));
+            } else {
+                utf8 += (char)(0xE0 | (code >> 12));
+                utf8 += (char)(0x80 | ((code >> 6) & 0x3F));
+                utf8 += (char)(0x80 | (code & 0x3F));
+            }
+        } else {
+            utf8 += e;  // \" \\ \/
+        }
+    }
+
+    int length = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), (int)utf8.size(),
+                                     nullptr, 0);
+    std::wstring wide(length, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.data(), (int)utf8.size(), wide.data(),
+                        length);
+    return wide;
+}
+
+// Downloads the notes of the installed version once, after each update: the
+// release with this version's tag.
+void EnsureWhatsNew() {
+    if (ReadLongStringSetting(L"whatsNewVersion") == WH_MOD_VERSION) {
+        return;
+    }
+
+    std::string json;
+    if (!HttpGet(L"https://api.github.com/repos/Will0wn/fluent-experience/"
+                 L"releases/tags/v" WH_MOD_VERSION,
+                 L"Accept: application/vnd.github+json", &json)) {
+        return;  // tried again at the next check
+    }
+
+    std::wstring notes = JsonReleaseBody(json);
+    WriteStringSetting(L"whatsNew", notes.c_str());
+    WriteStringSetting(L"whatsNewVersion", WH_MOD_VERSION);
+
+    if (HWND hWnd = g_settingsWindow) {
+        PostMessage(hWnd, kUpdateChangedMsg, 0, 0);
+    }
+}
+
 bool WriteFileBytes(const std::wstring& path, const std::string& data) {
     HANDLE file = CreateFile(path.c_str(), GENERIC_WRITE, 0, nullptr,
                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -5091,11 +5235,13 @@ DWORD WINAPI UpdateThreadProc(LPVOID) {
             WaitForMultipleObjects(ARRAYSIZE(events), events, FALSE, timeout);
 
         if (wait == WAIT_OBJECT_0 + 1) {
+            EnsureWhatsNew();
             CheckForUpdates();
             nextCheck = GetTickCount64() + kUpdateCheckInterval;
         } else if (wait == WAIT_OBJECT_0 + 2) {
             InstallUpdate();
         } else if (wait == WAIT_TIMEOUT) {
+            EnsureWhatsNew();
             if (g_settings.checkUpdates) {
                 CheckForUpdates();
             }
