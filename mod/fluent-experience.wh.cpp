@@ -2,7 +2,7 @@
 // @id              fluent-experience
 // @name            Fluent Experience for Windows 11
 // @description     Turns the Windows 11 taskbar into a compact, floating taskbar built on what Windows provides
-// @version         0.22
+// @version         0.23
 // @author          Will0wn
 // @github          https://github.com/Will0wn
 // @include         explorer.exe
@@ -4016,8 +4016,17 @@ std::wstring FormatWhatsNew(const std::wstring& notes) {
 void UpdateWhatsNewUi() {
     std::wstring notes;
     if (ReadLongStringSetting(L"whatsNewVersion") == WH_MOD_VERSION) {
-        notes = FormatWhatsNew(ReadLongStringSetting(L"whatsNew"));
+        notes = ReadLongStringSetting(L"whatsNew");
     }
+
+    // The release notes are English, then a "---" line, then Italian: the
+    // part of the window's language is shown. Without the line, all of it.
+    size_t separator = notes.find(L"\n---\n");
+    if (separator != std::wstring::npos) {
+        notes = g_settingsUi.italian ? notes.substr(separator + 5)
+                                     : notes.substr(0, separator);
+    }
+    notes = FormatWhatsNew(notes);
 
     SetCardTexts(L"WhatsNew", Text(L"WhatsNew"), notes.c_str());
     FindSettingsElement<Controls::Grid>(L"WhatsNewCard")
